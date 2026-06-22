@@ -1,6 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::env::var;
 use rustls_pki_types::{CertificateDer, pem::PemObject, PrivateKeyDer, pem::Error};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
@@ -12,37 +11,32 @@ use tokio_rustls::server::{TlsStream};
 use anyhow::{Context, Result};
 
 use crate::token::handle_tokenreview_request;
-use crate::ldap::LdapConnector;
+use crate::ldap::LdapBackend;
 
 enum ParseOutcome {
     Body(String),
     Handled(String),
 }
 
-fn load_cert(env_var: &str, path: &str) -> Result<CertificateDer<'static>, Error> {
-
-    let path = var(env_var).unwrap_or(path.to_string());
+fn load_cert(path: &str) -> Result<CertificateDer<'static>, Error> {
 
     CertificateDer::from_pem_file(path)
+
 }
 
-fn load_key() -> Result<PrivateKeyDer<'static>, Error> {
-
-    let path = var("K8S_LDAP_AUTH_KEY_PATH")
-            .unwrap_or("./pki/webhook-server.key".to_string());
+fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, Error> {
 
     PrivateKeyDer::from_pem_file(path)
+
 }
 
-fn set_tls() -> Result<TlsAcceptor> {
+fn set_tls(key_path: &str, server_cert_path: &str, ca_cert_path: &str) -> Result<TlsAcceptor> {
 
-    let ca_cert = load_cert("K8S_LDAP_AUTH_CA_CERT_PATH",
-                                "./pki/ca.crt").context("Could not load the CA certificate")?;
+    let ca_cert: CertificateDer<'_> = load_cert(ca_cert_path).context("Could not load the CA certificate")?;
 
-    let server_cert = load_cert("K8S_LDAP_AUTH_CERT_PATH",
-                                    "./pki/webhook-server.pem").context("Could not load the certificate for mTLS")?;
+    let server_cert: CertificateDer<'_> = load_cert(server_cert_path).context("Could not load the certificate for mTLS")?;
 
-    let key = load_key().context("Could not load the key for mTLS")?;
+    let key: PrivateKeyDer<'_> = load_key(key_path).context("Could not load the key for mTLS")?;
 
     let mut ca_root_store = RootCertStore::empty();
 
@@ -63,18 +57,23 @@ fn set_tls() -> Result<TlsAcceptor> {
 
 }
 
-pub async fn start_server(address: &str, port: u16) -> Result<String> {
+pub async fn start_server(
+    ip_address: String,
+    port: u16,
+    key_path: String,
+    server_cert_path: String,
+    ca_cert_path: String,
+    ldap_connector: Arc<dyn LdapBackend>
+) -> Result<String> {
 
     let addr = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::from_str(address)
+            IpAddr::V4(Ipv4Addr::from_str(&ip_address)
                         .unwrap_or(Ipv4Addr::new(0,0,0,0))),
             port);
 
-    let tls_handshaker = set_tls()?;
+    let tls_handshaker = set_tls(&key_path, &server_cert_path, &ca_cert_path)?;
 
     let listener = TcpListener::bind(&addr).await.context("Could not listen at the provided socket")?;
-
-    let ldap_connector = Arc::new(LdapConnector::new()?);
 
     println!("Listening on {addr}");
 
@@ -100,11 +99,12 @@ pub async fn start_server(address: &str, port: u16) -> Result<String> {
         });
 
     }
+
 }
 
-async fn handle_conn(stream: &mut TlsStream<TcpStream>, ldap_connector: &Arc<LdapConnector>) -> Result<()> {
+async fn handle_conn(stream: &mut TlsStream<TcpStream>, ldap_connector: &Arc<dyn LdapBackend>) -> Result<()> {
 
-    let peer_addr = stream.get_ref().0.peer_addr()?;
+    let peer_addr = stream.get_ref().0.peer_addr().context("Could not get the peer address")?;
 
     let body_str = match parse_http_request(stream, &peer_addr).await? {
         ParseOutcome::Handled(msg) => {
@@ -119,7 +119,7 @@ async fn handle_conn(stream: &mut TlsStream<TcpStream>, ldap_connector: &Arc<Lda
             token_review_str
         }
 
-        _ = check_remote_peer( stream, &peer_addr) => {
+        _ = check_remote_peer(stream, &peer_addr) => {
             return Ok(());
         }
     };

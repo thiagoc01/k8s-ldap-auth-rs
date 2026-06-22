@@ -4,8 +4,9 @@ use serde_json::{from_str, to_string};
 use base64::engine::Engine;
 use anyhow::{Context, Error, Result};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-use crate::ldap::LdapConnector;
+use crate::ldap::LdapBackend;
 
 fn retrieve_user_pass_from_token(token_base64: Option<String>) -> Result<(String, String)> {
 
@@ -99,7 +100,7 @@ fn create_tokenreview_status(search_entry: Option<SearchEntry>,
     }
 }
 
-pub async fn handle_tokenreview_request(request: &str, ldap_connector: &LdapConnector) -> Result<String> {
+pub async fn handle_tokenreview_request(request: &str, ldap_connector: &Arc<dyn LdapBackend>) -> Result<String> {
 
     let mut token_review_req = from_str::<TokenReview>(request).context("Error parsing JSON from request")?;
 
