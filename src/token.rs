@@ -118,3 +118,212 @@ pub async fn handle_tokenreview_request(request: &str, ldap_connector: &Arc<dyn 
 
     Ok(to_string(&token_review_req)?)
 }
+
+#[cfg(test)]
+mod tests {
+
+    use pretty_assertions::assert_eq;
+    use async_trait::async_trait;
+    use ldap3::SearchEntry;
+    use rstest::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+
+    struct LdapTest {
+        result: Result<SearchEntry, String>,
+        attrs: HashMap<String, String>
+    }
+
+    #[async_trait]
+    impl LdapBackend for LdapTest {
+
+        async fn search_user(&self, _user: &str, _pass: &str) -> anyhow::Result<SearchEntry> {
+
+            self.result
+                .as_ref()
+                .map(|e| e.clone())
+                .map_err(|e| anyhow::anyhow!(e.clone()))
+
+        }
+
+        fn get_attrs(&self) -> &HashMap<String, String> {
+
+            &self.attrs
+
+        }
+
+    }
+
+    fn make_entry(dn: &str, attrs: HashMap<String, Vec<String>>) -> SearchEntry {
+
+        SearchEntry {
+            dn: dn.to_string(),
+            attrs,
+            bin_attrs: HashMap::new(),
+        }
+
+    }
+
+    fn get_tokenreview_body(token: &str) -> String {
+
+        format!(
+            r#"
+                {{
+                    "apiVersion":"authentication.k8s.io/v1",
+                    "kind":"TokenReview",
+                    "spec":{{
+                        "token":"{}",
+                        "audiences": ["https://example.test", "https://internal.example.test"]
+                    }}
+                }}
+            "#,
+            token
+        )
+
+    }
+
+    #[fixture]
+    fn get_ldap_entry() -> Arc<LdapTest> {
+
+        let attrs = HashMap::from(
+            [
+                (
+                    "cn".to_string(),
+                    vec![
+                        "John Doe".to_string()
+                    ]
+                ),
+                (
+                    "givenName".to_string(),
+                    vec![
+                        "John".to_string()
+                    ]
+                ),
+                (
+                    "memberOf".to_string(),
+                    vec![
+                        "cn=group1,cn=groups,cn=accounts,dc=example,dc=test".to_string(),
+                        "cn=group2,cn=groups,cn=accounts,dc=example,dc=test".to_string()
+                    ]
+                ),
+                (
+                    "uid".to_string(),
+                    vec!["johndoe".to_string()]
+                )
+            ]
+
+        );
+
+        Arc::new(LdapTest {
+            result: Ok(make_entry("uid=johndoe,cn=users,cn=accounts,dc=example,dc=test", attrs)),
+            attrs: HashMap::from(
+                [
+                    ("k8s_extra_cn".to_string(), "cn".to_string()),
+                    ("k8s_extra_givenName".to_string(), "givenName".to_string()),
+                    ("groups".to_string(), "memberOf".to_string())
+                ]
+            )
+        })
+
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_token_tokenreview_status_all_fields(get_ldap_entry: Arc<dyn LdapBackend>) {
+
+        let ldap = get_ldap_entry;
+        let body = get_tokenreview_body("am9obmRvZTpwYXNzd29yZA==");
+        let response = from_str::<TokenReview>(
+            &handle_tokenreview_request(&body, &ldap).
+            await
+            .unwrap()
+        )
+        .unwrap();
+
+        assert_eq!(response.status.clone().unwrap().audiences.unwrap(), vec![
+                "https://example.test", "https://internal.example.test"
+            ]
+        );
+
+        assert_eq!(response.status.clone().unwrap().user.unwrap(), UserInfo {
+
+            extra: Some(BTreeMap::from(
+                [
+                    (
+                        "cn".to_string(),
+                        vec![
+                            "John Doe".to_string()
+                        ]
+                    ),
+                    (
+                        "givenName".to_string(),
+                        vec![
+                            "John".to_string()
+                        ]
+                    )
+                ]
+            )),
+
+            groups: Some(
+                vec![
+                    "group1".to_string(),
+                    "group2".to_string()
+                ]
+            ),
+
+            uid: None,
+
+            username: Some("johndoe".to_string())
+        });
+
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_token_valid_user_authenticated(get_ldap_entry: Arc<dyn LdapBackend>) {
+
+        let ldap = get_ldap_entry;
+        let body = get_tokenreview_body("dGVzdDpwYXNzd29yZA==");
+        let resp = handle_tokenreview_request(&body, &ldap).await.unwrap();
+        assert!(resp.contains("\"authenticated\":true"));
+
+    }
+
+    #[tokio::test]
+    async fn test_token_invalid_credentials_unauthenticated() {
+
+        let ldap: Arc<dyn LdapBackend> = Arc::new(LdapTest {
+            result: Err("Invalid Credentials".to_string()),
+            attrs: HashMap::new()
+        });
+
+        let body = get_tokenreview_body("dGVzdDpwYXNzd29yZGQ=");
+        let resp = handle_tokenreview_request(&body, &ldap).await.unwrap();
+        assert!(resp.contains("\"authenticated\":false"));
+
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_token_malformed_body_returns_err(get_ldap_entry: Arc<dyn LdapBackend>) {
+
+        let ldap = get_ldap_entry;
+        let resp = handle_tokenreview_request("not json", &ldap).await;
+        assert!(resp.is_err());
+
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_token_malformed(get_ldap_entry: Arc<dyn LdapBackend>) {
+
+        let ldap = get_ldap_entry;
+        let body = get_tokenreview_body("dGVzdDpwYXNzd29");
+        let resp = handle_tokenreview_request(&body, &ldap).await;
+        assert!(resp.is_err());
+
+    }
+
+}

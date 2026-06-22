@@ -74,7 +74,7 @@ impl Args {
             Self::save_arg(&matches, "ip-address", |address: String| address),
             Self::save_arg(&matches, "port", |port: String| {
                     port.parse().unwrap_or_else(|error| {
-                        println!("Couldn't not parse the provided port number,\
+                        println!("Could not parse the provided port number,\
                             falling back to port 7878. Caused by: {error}");
                         7878
                     })

@@ -331,9 +331,477 @@ impl LdapConnector {
             80 => "Other",
             _  => "Unknown",
         }
+
     }
 
-    pub fn get_attrs(&self) -> &HashMap<String, String> {
+}
+
+fn load_ca_certificate_ldap(path: &str) -> Result<Certificate> {
+
+    let mut cert_file = File::open(path).context("Error opening LDAP server CA file")?;
+
+    let mut buffer = vec![];
+
+    cert_file.read_to_end(&mut buffer).context("Error on reading LDAP server CA file")?;
+
+    let cert = Certificate::from_pem(&buffer).context("Error loading LDAP server CA")?;
+
+    Ok(cert)
+
+}
+
+#[async_trait]
+impl LdapBackend for LdapConnector {
+
+    async fn search_user(&self, user: &str, password: &str) -> Result<SearchEntry> {
+        self.search_user(user, password).await
+    }
+
+    fn get_attrs(&self) -> &HashMap<String, String> {
         &self.attrs
     }
+
+}
+
+#[cfg(test)]
+mod tests {
+
+    use rstest::*;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[fixture]
+    fn get_base_ldap_args() -> LdapArgs {
+        LdapArgs::new(
+            "ldap://localhost".to_string(),
+            "cn=admin,dc=example,dc=test".to_string(),
+            "secret".to_string(),
+            "dc=example,dc=test".to_string(),
+            "uid".to_string(),
+            "".to_string(),
+            "40".to_string(),
+            None
+        )
+    }
+
+    #[fixture]
+    fn get_base_ldap_args_wrong_scheme_ldap_url(mut get_base_ldap_args: LdapArgs) -> LdapArgs {
+        get_base_ldap_args.ldap_url = "http://localhost".to_string();
+        get_base_ldap_args
+    }
+
+    #[fixture]
+    fn get_base_ldap_args_ldaps_url(mut get_base_ldap_args: LdapArgs) -> LdapArgs {
+        get_base_ldap_args.ldap_url = "ldaps://localhost".to_string();
+        get_base_ldap_args.ldap_cacert_file_path = None;
+        get_base_ldap_args
+    }
+
+    #[fixture]
+    fn get_base_ldap_args_user_attr(mut get_base_ldap_args: LdapArgs) -> LdapArgs{
+        get_base_ldap_args.ldap_user_attr = "sAMAccountName".to_string();
+        get_base_ldap_args
+    }
+
+    #[fixture]
+    fn get_base_ldap_args_custom_search_attrs(mut get_base_ldap_args: LdapArgs) -> LdapArgs {
+        get_base_ldap_args.search_attrs = "username:uid,mail:mail".to_string();
+        get_base_ldap_args
+    }
+
+    #[fixture]
+    fn get_base_ldap_args_valid_cert(mut get_base_ldap_args: LdapArgs) -> LdapArgs {
+        get_base_ldap_args.ldap_url = "ldaps://localhost".to_string();
+        get_base_ldap_args.ldap_cacert_file_path = Some("./pki/ca/ca.crt".to_string());
+        get_base_ldap_args
+    }
+
+    #[fixture]
+    fn get_base_ldap_args_invalid_cert(mut get_base_ldap_args: LdapArgs) -> LdapArgs {
+        get_base_ldap_args.ldap_url = "ldaps://localhost".to_string();
+        get_base_ldap_args.ldap_cacert_file_path = Some("".to_string());
+        get_base_ldap_args
+    }
+
+    #[rstest]
+    fn test_ldap_new_ldapconnector_instance(get_base_ldap_args: LdapArgs) {
+        assert!(LdapConnector::new(get_base_ldap_args).is_ok());
+    }
+
+    #[rstest]
+    fn test_ldap_new_invalid_scheme(get_base_ldap_args_wrong_scheme_ldap_url: LdapArgs) {
+        assert!(LdapConnector::new(get_base_ldap_args_wrong_scheme_ldap_url).is_err());
+    }
+
+    #[rstest]
+    fn test_ldap_new_starttls_flag(get_base_ldap_args_ldaps_url: LdapArgs) {
+        let c = LdapConnector::new(get_base_ldap_args_ldaps_url).unwrap();
+        assert!(c.ldap_conn_settings.starttls());
+    }
+
+    #[rstest]
+    fn test_ldap_new_valid_ldap_ca_cert(get_base_ldap_args_valid_cert: LdapArgs) {
+        let c = LdapConnector::new(get_base_ldap_args_valid_cert).unwrap();
+        assert!(c.ldap_conn_settings.starttls());
+    }
+
+    #[rstest]
+    fn test_ldap_new_invalid_ldap_ca_cert(get_base_ldap_args_invalid_cert: LdapArgs) {
+        assert!(LdapConnector::new(get_base_ldap_args_invalid_cert).is_err());
+    }
+
+    #[rstest]
+    fn test_ldap_new_custom_attrs_parsed(get_base_ldap_args_custom_search_attrs: LdapArgs) {
+        let c = LdapConnector::new(get_base_ldap_args_custom_search_attrs).unwrap();
+        assert_eq!(c.get_attrs().get("username").unwrap(), "uid");
+        assert_eq!(c.get_attrs().get("mail").unwrap(), "mail");
+    }
+
+    #[rstest]
+    fn test_ldap_user_filter(get_base_ldap_args_user_attr: LdapArgs) {
+        let c = LdapConnector::new(get_base_ldap_args_user_attr).unwrap();
+        assert_eq!(c.search_filter, "(sAMAccountName={})");
+    }
+
+}
+
+#[cfg(all(test, feature = "tests-ldap-ext"))]
+mod tests_ldap_ext {
+
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rstest::*;
+    use testcontainers::{
+        ContainerAsync, GenericImage, Healthcheck,
+        ImageExt, core::{WaitFor, wait::HealthWaitStrategy },
+        runners::AsyncRunner};
+    use std::env::temp_dir;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+    use tokio::sync::OnceCell;
+    use dtor::*;
+
+    use super::*;
+
+    const LDAP_PORT: u16 = 389;
+    const LDAPS_PORT: u16 = 636;
+
+    #[fixture]
+    fn get_base_ldap_args() -> LdapArgs {
+        LdapArgs {
+            ldap_url: "ldap://localhost".to_string(),
+            ldap_bind_user: "cn=admin,dc=example,dc=test".to_string(),
+            ldap_bind_password: "admin".to_string(),
+            ldap_search_base: "ou=users,dc=example,dc=test".to_string(),
+            ldap_user_attr: "uid".to_string(),
+            search_attrs: "".to_string(),
+            ldap_timeout_conn: "40".to_string(),
+            ldap_cacert_file_path: None
+        }
+    }
+
+    static LDAP: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
+    static CERTS: OnceCell<Result<(String, String)>> = OnceCell::const_new();
+
+    async fn get_cert_key_test() -> &'static Result<(String, String)> {
+
+        CERTS.get_or_init(|| async {
+
+                let subject_alt_names =
+                    vec![
+                        "0.0.0.0".to_string(),
+                        "localhost".to_string(),
+                        "127.0.0.1".to_string()
+                    ];
+
+                let CertifiedKey { cert, signing_key } =
+                    generate_simple_self_signed(subject_alt_names).unwrap();
+
+                let cert_path = PathBuf::from(temp_dir()).join("webhook-server-ldap.pem");
+
+                let key_path = PathBuf::from(temp_dir()).join("webhook-server-ldap.key");
+
+                let mut cert_file = File::create(cert_path.clone())?;
+                let mut key_file = File::create(key_path.clone())?;
+
+                cert_file.write_all(cert.pem().as_bytes())?;
+                key_file.write_all(signing_key.serialize_pem().as_bytes())?;
+
+                Ok(
+                    (
+                        cert_path.to_string_lossy().into_owned(),
+                        key_path.to_string_lossy().into_owned()
+                    )
+                )
+
+            }
+        ).await
+
+    }
+
+    async fn get_container_tests() -> &'static ContainerAsync<GenericImage> {
+
+        let (cert_path, key_path) =
+            get_cert_key_test()
+            .await
+            .as_ref()
+            .clone()
+            .unwrap();
+
+        LDAP.get_or_init(|| async {
+            GenericImage::new("osixia/openldap", "1.5.0")
+            .with_wait_for(WaitFor::Healthcheck(HealthWaitStrategy::new()))
+            .with_health_check(Healthcheck::cmd_shell(
+                "ldapsearch -x -H ldap://127.0.0.1 -D 'cn=admin,dc=example,dc=test' \
+                -w admin -b 'dc=example,dc=test'"
+                )
+                .with_interval(Duration::from_secs(3))
+                .with_start_interval(Duration::from_secs(3))
+            )
+            .with_cmd(["--copy-service", "--loglevel","debug"])
+            .with_env_var("LDAP_ORGANISATION", "k8s-ldap-auth-rs")
+            .with_env_var("LDAP_DOMAIN", "example.test")
+            .with_env_var("LDAP_ADMIN_PASSWORD", "admin")
+            .with_env_var("LDAP_OVERLAY_MEMBEROF", "true")
+            .with_env_var("LDAP_TLS_CRT_FILENAME", "webhook-server.pem")
+            .with_env_var("LDAP_TLS_KEY_FILENAME", "webhook-server.key")
+            .with_env_var("LDAP_TLS_CA_CRT_FILENAME", "ca.crt")
+            .with_env_var("LDAP_TLS_VERIFY_CLIENT", "never")
+            .with_network("bridge")
+            .with_copy_to("/container/service/slapd/assets/config/bootstrap/ldif/1-ad-schema.ldif",
+                Path::new("./tests/ad-schema.ldif"))
+            .with_copy_to("/container/service/slapd/assets/config/bootstrap/ldif/2-bootstrap.ldif",
+                Path::new("./tests/entries.ldif"))
+            .with_copy_to("/container/service/slapd/assets/config/bootstrap/ldif/3-index.ldif",
+                Path::new("./tests/index-samaccountname.ldif"))
+            .with_copy_to("/container/service/slapd/assets/certs/webhook-server.pem",
+                Path::new(cert_path))
+            .with_copy_to("/container/service/slapd/assets/certs/webhook-server.key",
+                Path::new(key_path))
+            .with_copy_to("/container/service/slapd/assets/certs/ca.crt",
+                Path::new(cert_path))
+            .start()
+            .await
+            .unwrap()
+        }).await
+
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_search_user_dn_plain(mut get_base_ldap_args: LdapArgs) {
+
+        let container = get_container_tests().await;
+        let port = container.get_host_port_ipv4(LDAP_PORT).await.unwrap();
+
+        get_base_ldap_args.ldap_url = format!("ldap://127.0.0.1:{}", port);
+
+        let connector = LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry = connector.search_user("johndoe", "johndoepass").await.unwrap();
+        assert_eq!(entry.dn, "uid=johndoe,ou=users,dc=example,dc=test");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_search_user_dn(mut get_base_ldap_args: LdapArgs) {
+
+        let container = get_container_tests().await;
+        let port = container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path = CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url = format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+
+        let connector = LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry = connector.search_user("johndoe", "johndoepass").await.unwrap();
+        assert_eq!(entry.dn, "uid=johndoe,ou=users,dc=example,dc=test");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_get_attrs(mut get_base_ldap_args: LdapArgs) {
+
+        let container = get_container_tests().await;
+        let port = container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path = CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url = format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.search_attrs = "k8s_extra_sn:sn,groups:memberOf,k8s_extra_mail:mail".to_string();
+
+        let connector = LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry = connector.search_user("johndoe", "johndoepass").await.unwrap();
+        assert_eq!(entry.attrs, HashMap::from([
+            (
+                "sn".to_string(),
+                vec![
+                    "Doe".to_string()
+                ]
+            ),
+            (
+                "memberOf".to_string(),
+                vec![
+                    "cn=k8s-admins,ou=groups,dc=example,dc=test".to_string(),
+                    "cn=infra,ou=groups,dc=example,dc=test".to_string()
+                ]
+            ),
+            (
+                "mail".to_string(),
+                vec![
+                    "john@example.test".to_string()
+                ]
+            )
+        ]));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_different_search_base(mut get_base_ldap_args: LdapArgs) {
+
+        let container = get_container_tests().await;
+        let port = container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path = CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url = format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.ldap_search_base = "ou=sysaccounts,dc=example,dc=test".to_string();
+        get_base_ldap_args.search_attrs = "k8s_extra_cn:cn,k8s_extra_homeDirectory:homeDirectory".to_string();
+
+        let connector = LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry = connector.search_user("johndoe", "johndoesysaccount").await.unwrap();
+        assert_eq!(entry.attrs, HashMap::from([
+            (
+                "cn".to_string(),
+                vec![
+                    "John".to_string()
+                ]
+            ),
+            (
+                "homeDirectory".to_string(),
+                vec![
+                    "/home/johndoe".to_string()
+                ]
+            )
+        ]));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_different_user_attr(mut get_base_ldap_args: LdapArgs) {
+
+        let container = get_container_tests().await;
+        let port = container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path = CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url = format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.ldap_search_base = "ou=users,dc=example,dc=test".to_string();
+        get_base_ldap_args.search_attrs = "uid:uid,k8s_extra_homeDirectory:homeDirectory".to_string();
+        get_base_ldap_args.ldap_user_attr = "sAMAccountName".to_string();
+
+
+        let connector = LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry = connector.search_user("alicecooper", "alicecooperpass").await.unwrap();
+        assert_eq!(entry.attrs, HashMap::from([
+            (
+                "uid".to_string(),
+                vec![
+                    "alicecooper".to_string()
+                ]
+            ),
+            (
+                "homeDirectory".to_string(),
+                vec![
+                    "/home/alicecooper".to_string()
+                ]
+            )
+        ]));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_different_user_not_found(mut get_base_ldap_args: LdapArgs) {
+
+        let container = get_container_tests().await;
+        let port = container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path = CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url = format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.ldap_search_base = "ou=sysaccounts,dc=example,dc=test".to_string();
+
+        let connector = LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry = connector.search_user("alicecooper", "alicecooperpass").await;
+        assert_eq!(entry.err().unwrap().to_string(), "LDAP user alicecooper not found");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_timeout_desired(mut get_base_ldap_args: LdapArgs) {
+
+        let container = get_container_tests().await;
+        let port = container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path = CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url = format!("ldaps://1.1.1.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.ldap_timeout_conn = "3".to_string();
+
+        let connector = LdapConnector::new(get_base_ldap_args).unwrap();
+        let start = Instant::now();
+        let _ = connector.search_user("alicecooper", "alicecooperpass").await;
+        let duration = start.elapsed();
+        assert_eq!(duration.as_secs(), 3);
+
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_invalid_credentials(mut get_base_ldap_args: LdapArgs) {
+
+        let container = get_container_tests().await;
+        let port = container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path = CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url = format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.ldap_search_base = "ou=sysaccounts,dc=example,dc=test".to_string();
+        get_base_ldap_args.search_attrs = "".to_string();
+
+        let connector = LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry = connector.search_user("johndoe", "johndoepass").await;
+        assert_eq!(entry.err().unwrap().to_string(), "LDAP authentication failed for johndoe. Reason: Invalid Credentials");
+    }
+
+    #[dtor(unsafe)]
+    fn cleanup_ldap_container() {
+        if let Some(container) = LDAP.get() {
+
+            let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", container.id()])
+            .output();
+        }
+    }
+
+    #[dtor(unsafe)]
+    fn remove_pem_files() {
+
+        if let Some(Ok((cert_path, key_path))) = CERTS.get() {
+
+            let _ = std::fs::remove_file(cert_path);
+            let _ = std::fs::remove_file(key_path);
+
+        }
+
+    }
+
+
 }

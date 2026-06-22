@@ -1,0 +1,70 @@
+# tests/fixtures/bootstrap.ldif
+
+dn: ou=groups,dc=example,dc=test
+objectClass: organizationalUnit
+objectClass: top
+ou: groups
+
+dn: ou=users,dc=example,dc=test
+objectClass: top
+objectClass: organizationalUnit
+ou: users
+
+dn: ou=sysaccounts,dc=example,dc=test
+objectClass: top
+objectClass: organizationalUnit
+ou: sysaccounts
+
+# --- valid user, member of two groups ---
+dn: uid=johndoe,ou=users,dc=example,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+uid: johndoe
+cn: John Doe
+sn: Doe
+mail: john@example.test
+userPassword: johndoepass
+uidNumber: 10001
+gidNumber: 10001
+homeDirectory: /home/johndoe
+memberOf: cn=k8s-admins,ou=groups,dc=example,dc=test
+memberOf: cn=infra,ou=groups,dc=example,dc=test
+
+# --- valid user, single group ---
+dn: uid=alicecooper,ou=users,dc=example,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+objectClass: securityPrincipal
+sAMAccountName: alicecooper
+uid: alicecooper
+cn: Alice Cooper
+sn: Cooper
+mail: alice@example.test
+userPassword: alicecooperpass
+uidNumber: 10002
+gidNumber: 10002
+homeDirectory: /home/alicecooper
+
+# --- duplicate uid in another subtree: tests ambiguous search results ---
+dn: uid=johndoe,ou=sysaccounts,dc=example,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+uid: johndoe
+cn: John
+sn: Doe
+uidNumber: 10003
+gidNumber: 10003
+userPassword: johndoesysaccount
+homeDirectory: /home/johndoe
+
+dn: cn=k8s-admins,ou=groups,dc=example,dc=test
+objectClass: groupOfNames
+member: uid=johndoe,ou=users,dc=example,dc=test
+
+dn: cn=infra,ou=groups,dc=example,dc=test
+objectClass: groupOfNames
+member: uid=johndoe,ou=users,dc=example,dc=test
+member: uid=alicecooper,ou=users,dc=example,dc=test
