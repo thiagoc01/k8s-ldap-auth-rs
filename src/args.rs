@@ -32,21 +32,18 @@ impl Args {
 
         let env_file_path = Self::get_specific_arg(parser.clone(), "env-file", iter.clone());
 
+        #[cfg(test)]
+
         let load_env_res = from_filename_override(env_file_path);
 
-        if load_env_res.is_err() {
+        #[cfg(not(test))]
 
-            println!("Couldn't load environment file from the provided path neither from .env.\
-                Caused by: {}", load_env_res.err().unwrap()
-            );
-            println!("Trying to get the required values from the args");
-
-        }
-
-        Self::check_env_vars();
+        let mut load_env_res = from_filename_override(env_file_path);
 
         #[cfg(not(test))]
-        let mut parser: Command;
+        if load_env_res.is_err() {
+            load_env_res = dotenvy::dotenv();
+        }
 
         #[cfg(test)]
         let parser: Command;
