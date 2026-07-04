@@ -1,0 +1,23 @@
+blank_lines_lower_bound = 1
+
+combine_control_expr = false
+
+edition = "2024"
+
+force_multiline_blocks = true
+
+match_block_trailing_comma = true
+
+imports_granularity = "Crate"
+
+max_width = 70
+
+struct_lit_single_line = false
+
+trailing_comma = "Always"
+
+use_field_init_shorthand = true
+
+style_edition = "2024"
+
+wrap_comments = true
