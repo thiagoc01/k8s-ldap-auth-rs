@@ -94,13 +94,7 @@ pub async fn start_server(
     );
 
     let tls_handshaker =
-        set_tls(&key_path, &server_cert_path, &ca_cert_path)
-            .inspect_err(|e| {
-                tracing::error!(
-                    "{}",
-                    logging::format_error_chain(&**e)
-                );
-            })?;
+        set_tls(&key_path, &server_cert_path, &ca_cert_path)?;
 
     let listener = TcpListener::bind(&addr)
         .await
