@@ -402,7 +402,7 @@ mod tests {
     #[case("critical", matches!(Args::parse_log_level("critical"), LogLevel::CRITICAL))]
     #[case("garbage",  matches!(Args::parse_log_level("garbage"),  LogLevel::INFO))]
     #[case("",         matches!(Args::parse_log_level(""),         LogLevel::INFO))]
-    fn test_parse_log_level(#[case] _input: &str, #[case] result: bool) {
+    fn test_args_parse_log_level(#[case] _input: &str, #[case] result: bool) {
 
         assert!(result);
 
@@ -410,7 +410,7 @@ mod tests {
 
     #[rstest]
     #[serial]
-    fn test_default_args() {
+    fn test_args_default_args() {
 
         unsafe { clear_env() };
 
@@ -451,7 +451,7 @@ mod tests {
 
     #[rstest]
     #[serial]
-    fn test_custom_args(base_args: &'static Vec<&str>) {
+    fn test_args_custom_args(base_args: &'static Vec<&str>) {
 
         unsafe { clear_env() };
 
@@ -492,7 +492,7 @@ mod tests {
 
     #[rstest]
     #[serial]
-    fn test_invalid_port_falls_back_to_7878(base_args: &'static Vec<&str>) {
+    fn test_args_invalid_port_falls_back_to_7878(base_args: &'static Vec<&str>) {
 
         unsafe { clear_env() };
 
