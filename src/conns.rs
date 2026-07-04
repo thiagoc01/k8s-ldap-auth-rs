@@ -13,9 +13,11 @@ use anyhow::{Context, Result};
 use crate::token::handle_tokenreview_request;
 use crate::ldap::LdapBackend;
 
+use crate::logging;
+
 enum ParseOutcome {
-    Body(String),
-    Handled(String),
+    Body(String, String, usize),
+    Handled(u16, String, String, usize),
 }
 
 fn load_cert(path: &str) -> Result<CertificateDer<'static>, Error> {
@@ -34,21 +36,28 @@ fn set_tls(key_path: &str, server_cert_path: &str, ca_cert_path: &str) -> Result
 
     let ca_cert: CertificateDer<'_> = load_cert(ca_cert_path).context("Could not load the CA certificate")?;
 
+    tracing::debug!("Loading CA cert on path {}", ca_cert_path);
+
     let server_cert: CertificateDer<'_> = load_cert(server_cert_path).context("Could not load the certificate for mTLS")?;
+
+    tracing::debug!("Loading server cert on path {}", server_cert_path);
 
     let key: PrivateKeyDer<'_> = load_key(key_path).context("Could not load the key for mTLS")?;
 
+    tracing::debug!("Loading server key on path {}", key_path);
+
     let mut ca_root_store = RootCertStore::empty();
 
-    ca_root_store.add(ca_cert)?;
+    ca_root_store.add(ca_cert).context("Could not initialize CA root store")?;
 
     let client_cert_verifier = WebPkiClientVerifier::builder(
         ca_root_store.into())
-        .build()?;
+        .build().context("Could not create verifier for clients certificates")?;
 
     let server_tls_config = ServerConfig::builder()
         .with_client_cert_verifier(client_cert_verifier)
-        .with_single_cert(vec![server_cert], key)?;
+        .with_single_cert(vec![server_cert], key)
+        .context("Could not create TLS configuration for server")?;
 
     // TLS configured both for accept clients' certs signed with the CA provided
     // and to serve the cert and key pair
@@ -71,29 +80,51 @@ pub async fn start_server(
                         .unwrap_or(Ipv4Addr::new(0,0,0,0))),
             port);
 
-    let tls_handshaker = set_tls(&key_path, &server_cert_path, &ca_cert_path)?;
+    let tls_handshaker =
+        set_tls(&key_path, &server_cert_path, &ca_cert_path)
+        .inspect_err(|e| {
+                tracing::error!(
+                    "{}", logging::format_error_chain(&**e)
+                );
+            }
+        )?;
 
     let listener = TcpListener::bind(&addr).await.context("Could not listen at the provided socket")?;
 
-    println!("Listening on {addr}");
+    tracing::info!("Server listening on {addr}");
 
     loop {
 
         let (socket, socket_addr) = match listener.accept().await {
             Ok(connection) => connection,
-            Err(error) => { eprintln!("Could not start connection with {}", error); continue;}
+            Err(error) => {
+                tracing::error!("Could not start a connection. {}", logging::format_error_chain(&error));
+                continue;
+            }
         };
 
         let tls_handshaker = tls_handshaker.clone();
         let ldap_connector = ldap_connector.clone();
 
         tokio::spawn(async move {
+            let peer_ip = socket_addr.ip();
             match tls_handshaker.accept(socket).await {
+
                 Ok(mut tls_stream) => {
-                    let _ = handle_conn(&mut tls_stream, &ldap_connector).await;
+
+                    if let Err(error) = handle_conn(&mut tls_stream, &ldap_connector).await {
+                        tracing::error!("{} - {} - {}", peer_ip, 500, error);
+                    }
                 },
                 Err(error) => {
-                    eprintln!{"mTLS handshake error on connection {}. Error: {}", socket_addr, error.to_string()};
+                    if error.to_string().starts_with("invalid peer certificate") {
+                        tracing::error!("{} - {} - mTLS handshake failed - {}", peer_ip, 526, logging::format_error_chain(&error));
+                    }
+
+                    else {
+                        tracing::error!("{} - {} - mTLS handshake failed - {}", peer_ip, 525, logging::format_error_chain(&error));
+                    }
+
                 }
             }
         });
@@ -104,14 +135,21 @@ pub async fn start_server(
 
 async fn handle_conn(stream: &mut TlsStream<TcpStream>, ldap_connector: &Arc<dyn LdapBackend>) -> Result<()> {
 
-    let peer_addr = stream.get_ref().0.peer_addr().context("Could not get the peer address")?;
+    let peer_addr = stream.get_ref().0.peer_addr().context("Could not get the peer address")?.ip();
 
-    let body_str = match parse_http_request(stream, &peer_addr).await? {
-        ParseOutcome::Handled(msg) => {
-            println!("{msg}");
+    let (body_str, endpoint, bytes_read) = match parse_http_request(stream).await? {
+        ParseOutcome::Handled(code, endpoint, method, bytes_read) => {
+            if code == 400 || code == 411 || code == 413 {
+                tracing::warn!("{} - {} - {} {} - {}", peer_addr, code, method, endpoint, bytes_read);
+            }
+
+            else {
+                tracing::info!("{} - {} - {} {} - {}", peer_addr, code, method, endpoint, bytes_read);
+            }
+
             return Ok(());
         },
-        ParseOutcome::Body(body) => body,
+        ParseOutcome::Body(body, endpoint, bytes_read) => (body, endpoint, bytes_read),
     };
 
     let token_review_str = tokio::select! {
@@ -119,63 +157,16 @@ async fn handle_conn(stream: &mut TlsStream<TcpStream>, ldap_connector: &Arc<dyn
             token_review_str
         }
 
-        _ = check_remote_peer(stream, &peer_addr) => {
+        _ = _check_remote_peer(stream, &peer_addr, endpoint.clone()) => {
             return Ok(());
         }
     };
 
-    match token_review_str {
-
-        Ok(token_review_str) => {
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                token_review_str.len(),
-                token_review_str
-            );
-            stream.write_all(response.as_bytes()).await?;
-            stream.flush().await?;
-            stream.shutdown().await?;
-            println!("Connection {} closed with HTTP 200 status", peer_addr);
-            Ok(())
-            
-        }
-
-        Err(error) if error.to_string().starts_with("Error") => {
-
-            let response = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-            stream.write_all(response.as_bytes()).await?;
-            stream.flush().await?;
-            stream.shutdown().await?;
-            eprint!("Connection {} closed with HTTP 400 status; ", peer_addr);
-            for cause in error.chain() {
-                eprint!("{}; ", cause);
-            }
-            eprintln!("");
-            Ok(())
-
-        },
-
-        Err(error) => {
-            
-            let response = format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
-            stream.write_all(response.as_bytes()).await?;
-            stream.flush().await?;
-            stream.shutdown().await?;
-            eprintln!("Connection {} closed with HTTP 500 status; ", peer_addr);
-            for cause in error.chain() {
-                eprint!("{}; ", cause);
-            }
-            eprintln!("");
-            Ok(())
-
-        }
-
-    }
+    _verify_token_review_str_result(token_review_str, stream, endpoint, peer_addr, bytes_read).await
 
 }
 
-async fn parse_http_request(stream: &mut TlsStream<TcpStream>, peer_addr: &SocketAddr) -> Result<ParseOutcome> {
+async fn parse_http_request(stream: &mut TlsStream<TcpStream>) -> Result<ParseOutcome> {
 
     const MAX_SIZE_PAYLOAD : usize = 65536;
     let mut buffer = [0u8 ; 4096];
@@ -188,7 +179,7 @@ async fn parse_http_request(stream: &mut TlsStream<TcpStream>, peer_addr: &Socke
         let bytes_read = stream.read(&mut buffer).await?;
 
         if bytes_read == 0 {
-            return Ok(ParseOutcome::Handled(format!("Read 0 bytes from connection {}", peer_addr)))
+            return Ok(ParseOutcome::Handled(204, "UNKNOWN".to_string(), "UNKNOWN".to_string(), 0))
         }
 
         let old_len = raw_request.len();
@@ -210,10 +201,9 @@ async fn parse_http_request(stream: &mut TlsStream<TcpStream>, peer_addr: &Socke
 
         if raw_request.len() > MAX_SIZE_PAYLOAD {
 
-            stream.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n").await?;
-            stream.flush().await?;
-            stream.shutdown().await?;
-            return Ok(ParseOutcome::Handled(format!("Connection {} sent oversized headers", peer_addr)));
+            _send_response(stream, 413, b"").await?;
+
+            return Ok(ParseOutcome::Handled(413, "UNKNOWN".to_string(), "UNKNOWN".to_string(), raw_request.len()));
 
         }
 
@@ -221,58 +211,84 @@ async fn parse_http_request(stream: &mut TlsStream<TcpStream>, peer_addr: &Socke
 
     let request_str = String::from_utf8_lossy(&raw_request[..header_end]);
 
-    if !request_str.starts_with("POST /authenticate ") {
+    let (method, endpoint) =
+        request_str
+        .lines()
+        .next()
+        .and_then(|line| {
+            let method = line.split(' ').nth(0).unwrap_or("UNKNOWN");
+            let endpoint = line.split(' ').nth(1).map(|endpoint| {
+                if !endpoint.starts_with('/') {
+                    let endpoint= String::from("/") + endpoint;
+                    endpoint
+                }
+                else {
+                    endpoint.to_string()
+                }
+            }).unwrap_or("UNKNOWN".to_string());
 
-        stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await?;
-        stream.flush().await?;
-        stream.shutdown().await?;
-        return Ok(ParseOutcome::Handled(format!("Connection {} closed with HTTP 404 status", peer_addr)));
+            Some((method.to_string(), endpoint))
+        })
+        .unwrap_or(("UNKNOWN".to_string(), "UNKNOWN".to_string()));
 
+    if endpoint == "UNKNOWN" {
+        _send_response(stream, 400, b"", ).await?;
+        return Ok(ParseOutcome::Handled(400, endpoint, method, raw_request.len() - header_end));
     }
 
-    let content_length: usize = request_str
+    else if endpoint != "/authenticate" {
+        _send_response(stream, 404, b"").await?;
+        return Ok(ParseOutcome::Handled(404, endpoint, method, raw_request.len() - header_end));
+    }
+
+    else if method != "POST" {
+        _send_response(stream, 405, b"").await?;
+        return Ok(ParseOutcome::Handled(405, endpoint, method, raw_request.len() - header_end));
+    }
+
+    let content_length: Option<usize> = request_str
         .lines()
         .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
         .and_then(|line| line.split(':').nth(1))
-        .and_then(|length| length.trim().parse().ok())
-        .unwrap_or(0);
+        .and_then(|length| length.trim().parse::<usize>().ok())
+        .or(None);
 
-    if content_length == 0 {
+    if let Some(content_length) = content_length {
 
-        stream.write_all(b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n").await?;
-        stream.flush().await?;
-        stream.shutdown().await?;
-        return Ok(ParseOutcome::Handled(format!("Connection {} sent request without Content-Length header", peer_addr)));
+        if content_length > MAX_SIZE_PAYLOAD {
+            _send_response(stream, 413, b"").await?;
+            return Ok(ParseOutcome::Handled(413, endpoint, method, raw_request.len() - header_end));
+        }
+
+        let already_read_from_body = raw_request.len() - header_end;
+
+        if already_read_from_body < content_length {
+
+            let remaining = content_length - already_read_from_body;
+            let mut buffer = vec![0u8; remaining];
+            stream.read_exact(&mut buffer).await?;
+            raw_request.extend_from_slice(&buffer);
+
+        }
+
+        let body_str =
+            String::from_utf8_lossy(
+                &raw_request[header_end..header_end + content_length]
+            )
+            .into_owned();
+
+        Ok(ParseOutcome::Body(body_str, endpoint, content_length))
 
     }
 
-    if content_length > MAX_SIZE_PAYLOAD {
-
-        stream.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n").await?;
-        stream.flush().await?;
-        stream.shutdown().await?;
-        return Ok(ParseOutcome::Handled(format!("Connection {} sent oversized body", peer_addr)));
-
+    else {
+        _send_response(stream, 411, b"").await?;
+        return Ok(ParseOutcome::Handled(411, endpoint, method, header_end));
     }
-
-    let already_read_from_body = raw_request.len() - header_end;
-
-    if already_read_from_body < content_length {
-
-        let remaining = content_length - already_read_from_body;
-        let mut buffer = vec![0u8; remaining];
-        stream.read_exact(&mut buffer).await?;
-        raw_request.extend_from_slice(&buffer);
-
-    }
-
-    let body_str = String::from_utf8_lossy(&raw_request[header_end..header_end + content_length]).into_owned();
-
-    Ok(ParseOutcome::Body(body_str))
 
 }
 
-async fn check_remote_peer(stream: &mut TlsStream<TcpStream>, peer_addr: &SocketAddr) -> Result<()> {
+async fn _check_remote_peer(stream: &mut TlsStream<TcpStream>, peer_addr: &IpAddr, endpoint: String) -> Result<()> {
 
     const MAX_SIZE_PAYLOAD : usize = 65536;
 
@@ -282,7 +298,7 @@ async fn check_remote_peer(stream: &mut TlsStream<TcpStream>, peer_addr: &Socket
 
         Ok(0) => {
 
-            println!("Connection {} closed by the remote peer", peer_addr);
+            tracing::info!("{} - {} - {}", peer_addr, 499, endpoint);
             stream.shutdown().await?;
             Ok(())
 
@@ -294,13 +310,140 @@ async fn check_remote_peer(stream: &mut TlsStream<TcpStream>, peer_addr: &Socket
 
         Err(error) => {
 
-            println!("Connection {} reset", peer_addr);
+            tracing::error!("{} - {} - {}", peer_addr, 499, endpoint);
             stream.shutdown().await?;
             return Err(error.into());
 
         }
 
     }
+
+}
+
+async fn _verify_token_review_str_result(
+    token_review_str: Result<(String, String, bool)>,
+    stream: &mut TlsStream<TcpStream>,
+    endpoint: String,
+    peer_addr: IpAddr,
+    bytes_read: usize
+) -> Result<()>
+{
+
+    match token_review_str {
+
+        Ok((token_review_str, user, is_authenticated)) => {
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                token_review_str.len(),
+                token_review_str
+            )
+            .into_bytes();
+
+            if let Err(error) =
+                _send_response(
+                    stream, 200, &response
+                )
+                .await
+            {
+                return Err(
+                    anyhow::Error::msg(
+                        format!(
+                            "- {} - {} - Failed to send response - {}",
+                            endpoint,
+                            user,
+                            logging::format_error_chain(&*error)
+                        )
+                    )
+                );
+            }
+
+            if is_authenticated {
+                tracing::info!("{} - 200 - POST {} - {} - {} - SUCCESS", peer_addr, endpoint, bytes_read, user);
+            }
+
+            else {
+                tracing::info!("{} - 200 - POST {} - {} - {} - FAIL", peer_addr, endpoint, bytes_read, user);
+            }
+
+            Ok(())
+
+        }
+
+        Err(error) if error.to_string().starts_with("Error") => {
+
+            if let Err(error) =
+                _send_response(
+                    stream, 400, b""
+                )
+                .await
+            {
+                return Err(
+                    anyhow::Error::msg(
+                        format!(
+                            "- {} - Failed to send response - {}",
+                            endpoint,
+                            logging::format_error_chain(&*error)
+                        )
+                    )
+                );
+            }
+
+            tracing::warn!("{} - 400 - POST {} - {} - ERROR - {}", peer_addr, endpoint, bytes_read, logging::format_error_chain(&*error));
+
+            Ok(())
+
+        },
+
+        Err(error) => {
+
+            if let Err(error) =
+                _send_response(
+                    stream, 500, b""
+                )
+                .await
+            {
+                return Err(
+                    anyhow::Error::msg(
+                        format!(
+                            "- {} - Failed to send response - {}",
+                            endpoint,
+                            logging::format_error_chain(&*error)
+                        )
+                    )
+                );
+            }
+
+            tracing::error!("{} - 500 - POST {} - {} - ERROR - {}", peer_addr, endpoint, bytes_read, logging::format_error_chain(&*error));
+
+            Ok(())
+
+        }
+
+    }
+
+}
+
+async fn _send_response(stream: &mut TlsStream<TcpStream>, code: u16, response: &[u8]) -> Result<()> {
+
+    let response: &[u8] = match code {
+
+        200 => response,
+        400 => b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+        404 => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        405 => b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+        411 => b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n",
+        413 => b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n",
+        500 => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+        _ => b""
+
+    };
+
+    stream.write_all(response).await?;
+    stream.flush().await?;
+    stream.shutdown().await?;
+
+    Ok(())
 
 }
 

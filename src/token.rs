@@ -100,7 +100,7 @@ fn create_tokenreview_status(search_entry: Option<SearchEntry>,
     }
 }
 
-pub async fn handle_tokenreview_request(request: &str, ldap_connector: &Arc<dyn LdapBackend>) -> Result<String> {
+pub async fn handle_tokenreview_request(request: &str, ldap_connector: &Arc<dyn LdapBackend>) -> Result<(String, String, bool)> {
 
     let mut token_review_req = from_str::<TokenReview>(request).context("Error parsing JSON from request")?;
 
@@ -116,7 +116,7 @@ pub async fn handle_tokenreview_request(request: &str, ldap_connector: &Arc<dyn 
     token_review_req.spec.audiences = None;
     token_review_req.spec.token = None;
 
-    Ok(to_string(&token_review_req)?)
+    Ok((to_string(&token_review_req)?, user, token_review_req.status.unwrap().authenticated.unwrap()))
 }
 
 #[cfg(test)]
@@ -236,9 +236,10 @@ mod tests {
         let ldap = get_ldap_entry;
         let body = get_tokenreview_body("am9obmRvZTpwYXNzd29yZA==");
         let response = from_str::<TokenReview>(
-            &handle_tokenreview_request(&body, &ldap).
-            await
+            &handle_tokenreview_request(&body, &ldap)
+            .await
             .unwrap()
+            .0
         )
         .unwrap();
 
@@ -285,9 +286,14 @@ mod tests {
     async fn test_token_valid_user_authenticated(get_ldap_entry: Arc<dyn LdapBackend>) {
 
         let ldap = get_ldap_entry;
-        let body = get_tokenreview_body("dGVzdDpwYXNzd29yZA==");
-        let resp = handle_tokenreview_request(&body, &ldap).await.unwrap();
+        let body = get_tokenreview_body("am9obmRvZTpwYXNzd29yZA==");
+        let (resp, user, is_authenticated) =
+            handle_tokenreview_request(&body, &ldap)
+            .await
+            .unwrap();
         assert!(resp.contains("\"authenticated\":true"));
+        assert_eq!(user, "johndoe");
+        assert!(is_authenticated);
 
     }
 
@@ -299,9 +305,14 @@ mod tests {
             attrs: HashMap::new()
         });
 
-        let body = get_tokenreview_body("dGVzdDpwYXNzd29yZGQ=");
-        let resp = handle_tokenreview_request(&body, &ldap).await.unwrap();
+        let body = get_tokenreview_body("am9obmRvZTpwYXNzd29yZGQ=");
+        let (resp, user, is_authenticated) =
+            handle_tokenreview_request(&body, &ldap)
+            .await
+            .unwrap();
         assert!(resp.contains("\"authenticated\":false"));
+        assert_eq!(user, "johndoe");
+        assert!(!is_authenticated);
 
     }
 

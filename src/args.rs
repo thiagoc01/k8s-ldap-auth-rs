@@ -1,27 +1,47 @@
 use clap::{Arg, Command, ArgMatches};
 use dotenvy::from_filename_override;
-use std::env::vars;
-use anyhow::Result;
+use anyhow::{Result, Context};
+use std::path::Path;
 
 use crate::ldap::LdapArgs;
+use crate::logging;
 
 #[derive(PartialEq, Eq)]
 pub enum LogLevel {
     DEBUG,
     INFO,
     WARN,
-    ERROR,
-    CRITICAL
+    ERROR
 }
 
+pub const POSSIBLE_ENV_VARS: [(&str, &str); 13] = [
+    ("K8S_LDAP_AUTH_KEY_PATH", "./pki/server/webhook-server.key"),
+    ("K8S_LDAP_AUTH_CERT_PATH", "./pki/server/webhook-server.pem"),
+    ("K8S_LDAP_AUTH_CA_CERT_PATH", "./pki/ca/ca.crt"),
+    ("K8S_LDAP_AUTH_LDAP_URL", ""),
+    ("K8S_LDAP_AUTH_LDAP_BIND_USER", ""),
+    ("K8S_LDAP_AUTH_LDAP_BIND_PASSWORD", ""),
+    ("K8S_LDAP_AUTH_LDAP_SEARCH_BASE", ""),
+    ("K8S_LDAP_AUTH_LOG_LEVEL", "INFO"),
+    ("K8S_LDAP_AUTH_LDAP_CA_CERT_PATH", "None"),
+    ("K8S_LDAP_AUTH_LDAP_SEARCH_ATTRS", "None"),
+    ("K8S_LDAP_AUTH_LDAP_TIMEOUT_CONN", "40"),
+    ("K8S_LDAP_AUTH_LDAP_USER_ATTR", "uid"),
+    ("K8S_LDAP_AUTH_LOG_FILE_PATH", "None")
+];
+
 pub struct Args {
+
     log_level: LogLevel,
+    log_file_path: Option<String>,
     socket_args: (String, u16),
     tls_args: (String, String, String),
     ldap_args: LdapArgs
+
 }
 
 impl Args {
+
     pub fn new<I, T>(iter: I, version: &'static str) -> Result<Self>
     where
         I: IntoIterator<Item = T> + Clone,
@@ -50,6 +70,27 @@ impl Args {
         parser = Self::create_parser(&version);
 
         let log_level =  Self::get_specific_arg(parser.clone(), "log-level", iter.clone());
+
+        let log_file_path =
+            match Self::get_specific_arg(parser.clone(), "log-file-path", iter.clone()) {
+                path if path.is_empty() => None,
+                path => Some(path)
+            };
+
+        let log_level = Self::parse_log_level(&log_level);
+
+        logging::print_banner(version, log_file_path.as_deref().map(Path::new));
+        logging::init_logging(&log_level,log_file_path.as_deref().map(Path::new))
+            .context("Error on configuring logging.")?;
+
+        if load_env_res.is_err() {
+
+            tracing::warn!("Could not load environment file from the provided path neither from .env.\n\
+                \tCaused by: {}", load_env_res.err().unwrap()
+            );
+            tracing::warn!("Trying to get required values from the args");
+
+        }
 
         let matches = match parser.clone().try_get_matches_from(iter) {
             Ok(matches) => matches,
@@ -84,7 +125,8 @@ impl Args {
 
         Ok(
             Args {
-                log_level: Self::parse_log_level(&log_level),
+                log_level,
+                log_file_path,
                 socket_args,
                 tls_args,
                 ldap_args: LdapArgs::new(
@@ -142,16 +184,6 @@ impl Args {
 
     }
 
-    fn check_env_vars() {
-
-        for (k, _) in vars() {
-            if k.starts_with("K8S_LDAP_AUTH") {
-                println!("Loaded environment variable {}", k); // DEBUG
-            }
-        }
-
-    }
-
     fn parse_log_level(log_level: &str) -> LogLevel {
 
         match &log_level.to_uppercase()[..] {
@@ -159,7 +191,6 @@ impl Args {
             "INFO" => LogLevel::INFO,
             "WARN" => LogLevel::WARN,
             "ERROR" => LogLevel::ERROR,
-            "CRITICAL" => LogLevel::CRITICAL,
             _ => LogLevel::INFO
         }
 
@@ -184,12 +215,20 @@ impl Args {
         .arg(
             Arg::new("log-level")
             .env("K8S_LDAP_AUTH_LOG_LEVEL")
-            //.value_parser(["DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"])
+            .value_parser(["DEBUG", "INFO", "WARN", "ERROR"])
             .default_value("INFO")
             .ignore_case(true)
             .value_name("LEVEL")
             .num_args(1)
             .long("log-level")
+        )
+        .arg(
+            Arg::new("log-file-path")
+            .env("K8S_LDAP_AUTH_LOG_FILE_PATH")
+            .default_value("")
+            .value_name("PATH")
+            .num_args(1)
+            .long("log-file-path")
         )
         .arg(
             Arg::new("ip-address")
@@ -325,9 +364,9 @@ impl Args {
 
     }
 
-    pub fn get_all_args(self) -> ((String, u16), (String, String, String), LdapArgs) {
+    pub fn get_all_args(self) -> ((String, u16), (String, String, String), LdapArgs, LogLevel, Option<String>) {
 
-        (self.socket_args, self.tls_args, self.ldap_args)
+        (self.socket_args, self.tls_args, self.ldap_args, self.log_level, self.log_file_path)
 
     }
 
@@ -382,7 +421,8 @@ mod tests {
             "K8S_LDAP_AUTH_LDAP_CA_CERT_PATH",
             "K8S_LDAP_AUTH_LDAP_SEARCH_ATTRS",
             "K8S_LDAP_AUTH_LDAP_TIMEOUT_CONN",
-            "K8S_LDAP_AUTH_LDAP_USER_ATTR"
+            "K8S_LDAP_AUTH_LDAP_USER_ATTR",
+            "K8S_LDAP_AUTH_LOG_FILE_PATH"
         ] {
             unsafe { env::remove_var(key) };
         }
@@ -394,7 +434,6 @@ mod tests {
     #[case("info",     matches!(Args::parse_log_level("info"),     LogLevel::INFO))]
     #[case("Warn",     matches!(Args::parse_log_level("Warn"),     LogLevel::WARN))]
     #[case("ERROR",    matches!(Args::parse_log_level("ERROR"),    LogLevel::ERROR))]
-    #[case("critical", matches!(Args::parse_log_level("critical"), LogLevel::CRITICAL))]
     #[case("garbage",  matches!(Args::parse_log_level("garbage"),  LogLevel::INFO))]
     #[case("",         matches!(Args::parse_log_level(""),         LogLevel::INFO))]
     fn test_args_parse_log_level(#[case] _input: &str, #[case] result: bool) {
@@ -422,7 +461,9 @@ mod tests {
         let (
             (ip, port),
             (key, cert, cacert),
-            ldap_args
+            ldap_args,
+            _,
+            _
         ) = Args::new(args, VERSION).unwrap().get_all_args();
 
         assert_eq!(ip, "0.0.0.0");
@@ -464,7 +505,9 @@ mod tests {
         let (
             (ip, port),
             (key, cert, cacert),
-            ldap_args
+            ldap_args,
+            _,
+            _
         ) = Args::new(args, VERSION).unwrap().get_all_args();
 
         assert_eq!(ip, "127.0.0.1");
@@ -496,6 +539,8 @@ mod tests {
 
         let (
             (_, port),
+            _,
+            _,
             _,
             _
         ) = Args::new(args, VERSION).unwrap().get_all_args();
@@ -543,6 +588,8 @@ mod tests {
         let (
             _,
             (key, cert, cacert),
+            _,
+            _,
             _
         ) = Args::new(args, VERSION).unwrap().get_all_args();
 
@@ -560,7 +607,6 @@ mod tests {
     #[case("INFO",    LogLevel::INFO)]
     #[case("WARN",     LogLevel::WARN)]
     #[case("ERROR",    LogLevel::ERROR)]
-    #[case("CRITICAL", LogLevel::CRITICAL)]
     #[serial]
     fn test_args_log_level_from_cli(#[case] level: &'static str, #[case] expected: LogLevel) {
 
@@ -577,6 +623,33 @@ mod tests {
 
     #[rstest]
     #[serial]
+    fn test_args_log_file_path_from_cli() {
+
+        unsafe { clear_env() };
+
+        let mut args = base_args();
+        args.extend(["--log-file-path", r"/var/log/k8s-ldap-auth.log"]);
+
+        let parsed = Args::new(args, VERSION).unwrap();
+
+        assert_eq!(parsed.log_file_path, Some(r"/var/log/k8s-ldap-auth.log".to_string()));
+
+    }
+
+    #[rstest]
+    #[serial]
+    fn test_args_no_log_file_path(base_args: &Vec<&str>) {
+
+        unsafe { clear_env() };
+
+        let parsed = Args::new(base_args, VERSION).unwrap();
+
+        assert_eq!(parsed.log_file_path, None);
+
+    }
+
+    #[rstest]
+    #[serial]
     fn test_args_ldap_cacert_absent(base_args: &'static Vec<&str>) {
 
         unsafe { clear_env() };
@@ -586,7 +659,9 @@ mod tests {
         let (
             _,
             _,
-            ldap_args
+            ldap_args,
+            _,
+            _
         ) = Args::new(base_args, VERSION).unwrap().get_all_args();
 
         assert_eq!(
@@ -617,7 +692,9 @@ mod tests {
         let (
             _,
             _,
-            ldap_args
+            ldap_args,
+            _,
+            _
         ) = Args::new(args, VERSION).unwrap().get_all_args();
 
         assert_eq!(
@@ -648,7 +725,9 @@ mod tests {
         let (
             _,
             _,
-            ldap_args
+            ldap_args,
+            _,
+            _
         ) = Args::new(args, VERSION).unwrap().get_all_args();
 
         assert_eq!(
@@ -688,7 +767,8 @@ mod tests {
             ("K8S_LDAP_AUTH_LDAP_USER_ATTR=sAMAccountName"),
             ("K8S_LDAP_AUTH_LDAP_SEARCH_ATTRS=k8s_extra_cn:cn"),
             ("K8S_LDAP_AUTH_LDAP_TIMEOUT_CONN=9"),
-            ("K8S_LDAP_AUTH_LOG_LEVEL=CRITICAL")
+            ("K8S_LDAP_AUTH_LOG_LEVEL=ERROR"),
+            ("K8S_LDAP_AUTH_LOG_FILE_PATH=/var/log/k8s-ldap-auth.log")
         ];
 
         for env_var in env_vars {
@@ -697,18 +777,19 @@ mod tests {
 
         let args = vec!["k8s-ldap-auth-rs", "--env-file", env_file_path.to_str().unwrap()];
 
-        let log_level = Args::new(args.clone(), VERSION).unwrap().log_level;
-
         let (
             _,
             (key, cert, cacert),
-            ldap_args
+            ldap_args,
+            log_level,
+            log_file_path
         ) = Args::new(args, VERSION).unwrap().get_all_args();
 
         assert_eq!(key, "env-file/server.key");
         assert_eq!(cert, "env-file/server.pem");
         assert_eq!(cacert, "env-file/ca.crt");
-        assert!(log_level == LogLevel::CRITICAL);
+        assert!(log_level == LogLevel::ERROR);
+        assert!(log_file_path == Some("/var/log/k8s-ldap-auth.log".to_string()));
 
         assert_eq!(
             ldap_args,

@@ -1,5 +1,5 @@
 use anyhow::{Context, Error, Result};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings,
     LdapError, LdapResult, Scope, SearchEntry};
@@ -87,7 +87,7 @@ impl LdapConnector {
         }
 
         else {
-            return Err(Error::msg("Provide a URL that starts with ldap or ldaps".to_string()));
+            return Err(Error::msg("Provide a valid URL that starts with ldap or ldaps".to_string()));
         }
 
         let timeout =
@@ -204,11 +204,15 @@ impl LdapConnector {
             .await
             .context("Error on opening connection with LDAP server")?;
 
+        tracing::debug!("Successfully opened LDAP connection with {}", self.url_ldap);
+
         ldap3::drive!(conn);
 
         self.bind_search_user(&mut ldap).await?.success().context("Error on connecting to LDAP with bind user")?;
 
         let final_filter = self.search_filter.replace("{}", user);
+
+        let time_before_search = Instant::now();
 
         let (
             mut results,
@@ -242,6 +246,10 @@ impl LdapConnector {
                                 ) 
                             }
             }?;
+
+        let time_after_search = time_before_search.elapsed();
+
+        tracing::debug!("Search for user {} in LDAP server took {} ms", user, time_after_search.as_millis());
 
         let user_ldap =
             if let Some(entry) = results.pop() {
