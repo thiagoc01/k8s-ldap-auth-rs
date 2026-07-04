@@ -45,7 +45,6 @@ impl Args {
             load_env_res = dotenvy::dotenv();
         }
 
-        #[cfg(test)]
         let parser: Command;
 
         parser = Self::create_parser(&version);
@@ -58,7 +57,6 @@ impl Args {
 
                 #[cfg(not(test))] {
                     let _ = error.print();
-                    let _ = parser.print_help();
                     std::process::exit(1);
                 }
 
