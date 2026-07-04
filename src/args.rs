@@ -101,7 +101,7 @@ impl Args {
                 load_env_res.err().unwrap()
             );
             tracing::warn!(
-                "Trying to get required values from the args"
+                "Trying to get required values from the args and preexistent environment variables"
             );
         }
 
