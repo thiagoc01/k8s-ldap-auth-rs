@@ -7,10 +7,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 use tokio_rustls::server::TlsStream;
+use tokio_util::task::TaskTracker;
 
 use crate::ldap::LdapBackend;
 use crate::token::handle_tokenreview_request;
@@ -84,7 +86,7 @@ pub async fn start_server(
     server_cert_path: String,
     ca_cert_path: String,
     ldap_connector: Arc<dyn LdapBackend>,
-) -> Result<String> {
+) -> Result<()> {
     let addr = SocketAddr::new(
         IpAddr::V4(
             Ipv4Addr::from_str(&ip_address)
@@ -92,6 +94,13 @@ pub async fn start_server(
         ),
         port,
     );
+
+    let tracker = TaskTracker::new();
+
+    let mut sigterm_handler = signal(SignalKind::terminate())
+        .context("Could not set up SIGTERM handler")?;
+    let mut sigint_handler = signal(SignalKind::interrupt())
+        .context("Could not set up SIGINT handler")?;
 
     let tls_handshaker =
         set_tls(&key_path, &server_cert_path, &ca_cert_path)?;
@@ -103,59 +112,88 @@ pub async fn start_server(
     tracing::info!("Server listening on {addr}");
 
     loop {
-        let (socket, socket_addr) = match listener.accept().await {
-            Ok(connection) => connection,
-            Err(error) => {
-                tracing::error!(
-                    "Could not start a connection. {}",
-                    logging::format_error_chain(&error)
-                );
-                continue;
-            },
-        };
+        tokio::select! {
 
-        let tls_handshaker = tls_handshaker.clone();
-        let ldap_connector = ldap_connector.clone();
+            listener_accept_res = listener.accept() => {
 
-        tokio::spawn(async move {
-            let peer_ip = socket_addr.ip();
-            match tls_handshaker.accept(socket).await {
-                Ok(mut tls_stream) => {
-                    if let Err(error) =
-                        handle_conn(&mut tls_stream, &ldap_connector)
-                            .await
-                    {
+                let (socket, socket_addr) = match listener_accept_res {
+                    Ok(connection) => connection,
+                    Err(error) => {
                         tracing::error!(
-                            "{} - {} - {}",
-                            peer_ip,
-                            500,
-                            error
-                        );
-                    }
-                },
-                Err(error) => {
-                    if error
-                        .to_string()
-                        .starts_with("invalid peer certificate")
-                    {
-                        tracing::error!(
-                            "{} - {} - mTLS handshake failed - {}",
-                            peer_ip,
-                            526,
+                            "Could not start a connection. {}",
                             logging::format_error_chain(&error)
                         );
-                    } else {
-                        tracing::error!(
-                            "{} - {} - mTLS handshake failed - {}",
-                            peer_ip,
-                            525,
-                            logging::format_error_chain(&error)
-                        );
+                        continue;
+                    },
+                };
+
+                let tls_handshaker = tls_handshaker.clone();
+                let ldap_connector = ldap_connector.clone();
+
+                tracker.spawn(async move {
+                    let peer_ip = socket_addr.ip();
+                    match tls_handshaker.accept(socket).await {
+                        Ok(mut tls_stream) => {
+                            if let Err(error) =
+                                handle_conn(&mut tls_stream, &ldap_connector)
+                                    .await
+                            {
+                                tracing::error!(
+                                    "{} - {} - {}",
+                                    peer_ip,
+                                    500,
+                                    error
+                                );
+                            }
+                        },
+                        Err(error) => {
+                            if error
+                                .to_string()
+                                .starts_with("invalid peer certificate")
+                            {
+                                tracing::error!(
+                                    "{} - {} - mTLS handshake failed - {}",
+                                    peer_ip,
+                                    526,
+                                    logging::format_error_chain(&error)
+                                );
+                            } else {
+                                tracing::error!(
+                                    "{} - {} - mTLS handshake failed - {}",
+                                    peer_ip,
+                                    525,
+                                    logging::format_error_chain(&error)
+                                );
+                            }
+                        },
                     }
-                },
+                });
             }
-        });
+            _ = sigterm_handler.recv() => {
+                tracing::warn!("Received SIGTERM. Stopping socket accept loop...");
+                break;
+            }
+            _ = sigint_handler.recv() => {
+                tracing::warn!("Received SIGINT. Stopping socket accept loop...");
+                break;
+            }
+
+        }
     }
+
+    tracing::info!(
+        "Server stop requested. Waiting for active connections to finish..."
+    );
+
+    tracker.close();
+    tracker.wait().await; // Waits for all connection completions
+
+    tracing::info!(
+        "All active connections after stop request are finished."
+    );
+    tracing::info!("Server shutdown completed");
+
+    Ok(())
 }
 
 async fn handle_conn(
