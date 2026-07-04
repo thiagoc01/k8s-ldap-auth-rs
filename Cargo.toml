@@ -2,6 +2,11 @@
 name = "k8s-ldap-auth-rs"
 version = "0.3.0"
 edition = "2024"
+description = "A webhook authentication server for a Kubernetes cluster"
+keywords = ["kubernetes", "k8s", "webhook-authentication", "rust", "ldap"]
+license = "Apache-2.0"
+rust-version = "1.96.1"
+repository = "https://github.com/thiagoc01/k8s-ldap-auth-rs"
 
 [dependencies]
 clap = {version = "4.6", features = ["env"] }
