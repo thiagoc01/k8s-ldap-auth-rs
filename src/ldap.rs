@@ -1,14 +1,16 @@
 use anyhow::{Context, Error, Result};
 use async_trait::async_trait;
 use ldap3::{
-    Ldap, LdapConnAsync, LdapConnSettings, LdapError, LdapResult,
-    Scope, SearchEntry,
+    Ldap, LdapConnAsync, LdapConnSettings, LdapError, Scope,
+    SearchEntry,
 };
 use native_tls::{Certificate, TlsConnector};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::time::{Duration, Instant};
+
+use crate::logging;
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct LdapArgs {
@@ -173,18 +175,10 @@ impl LdapConnector {
         .await
     }
 
-    async fn bind_search_user(
-        &self,
-        ldap: &mut Ldap,
-    ) -> Result<LdapResult> {
-        match ldap
-            .simple_bind(&self.bind_user, &self.bind_password)
-            .await?
-            .success()
-        {
-            Ok(ldap) => Ok(ldap),
-            Err(error) => Err(Error::from(error)),
-        }
+    fn format_log_ldap_error(&self, message: String) -> Error {
+        let error_msg = Error::msg(message);
+        tracing::debug!("{}", error_msg); // Return value in TokenReview already shows the reason
+        return error_msg;
     }
 
     pub async fn search_user(
@@ -204,10 +198,26 @@ impl LdapConnector {
 
         ldap3::drive!(conn);
 
-        self.bind_search_user(&mut ldap)
+        match ldap
+            .simple_bind(&self.bind_user, &self.bind_password)
             .await?
             .success()
-            .context("Error on connecting to LDAP with bind user")?;
+        {
+            Err(LdapError::LdapResult { result }) => {
+                return Err(self.format_log_ldap_error(format!("LDAP bind user authentication failed. Reason: {}", self.ldap_rc_to_str(result.rc))));
+            },
+
+            Err(error) => {
+                tracing::debug!(
+                    "LDAP bind user authentication failed. {}",
+                    logging::format_error_chain(&error)
+                );
+                return Err(Error::msg(format!(
+                    "LDAP bind user authentication failed"
+                )));
+            },
+            _ => {},
+        }
 
         let final_filter = self.search_filter.replace("{}", user);
 
@@ -225,19 +235,20 @@ impl LdapConnector {
         {
             Ok(results) => Ok(results),
 
-            Err(error) => {
-                if let LdapError::LdapResult { result } = error {
-                    Err(Error::msg(format!(
-                        "LDAP search failed for {}.\
+            Err(LdapError::LdapResult { result }) => Err(self
+                .format_log_ldap_error(format!(
+                    "LDAP search failed for {}.\
                                             Reason {}",
-                        &user,
-                        self.ldap_rc_to_str(result.rc)
-                    )))
-                } else {
-                    Err(Error::msg(format!(
-                        "LDAP search unknown error"
-                    )))
-                }
+                    &user,
+                    self.ldap_rc_to_str(result.rc)
+                ))),
+
+            Err(error) => {
+                tracing::debug!(
+                    "LDAP search unknown error. {}",
+                    logging::format_error_chain(&error)
+                );
+                Err(Error::msg(format!("LDAP search unknown error")))
             },
         }?;
 
@@ -259,18 +270,18 @@ impl LdapConnector {
             {
                 Ok(_) => Ok(search_entry),
 
-                Err(error) => match error {
-                    LdapError::LdapResult { result } => {
-                        Err(Error::msg(format!(
+                Err(LdapError::LdapResult { result }) => {
+                   Err(self.format_log_ldap_error(format!(
                             "LDAP authentication failed for {}. Reason: {}",
                             &user,
                             self.ldap_rc_to_str(result.rc)
                         )))
-                    },
-                    _ => {
-                        Err(Error::msg(format!("LDAP unknown error")))
-                    },
                 },
+
+                Err(error) => {
+                    tracing::debug!("LDAP authentication failed. {}", logging::format_error_chain(&error));
+                    Err(Error::msg(format!("LDAP authentication failed")))
+                }
             }
         } else {
             Err(Error::msg(format!("LDAP user {} not found", user)))
