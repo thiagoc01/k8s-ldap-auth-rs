@@ -5,6 +5,7 @@ use rustls_pki_types::{
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -20,8 +21,37 @@ use crate::token::handle_tokenreview_request;
 use crate::logging;
 
 enum ParseOutcome {
-    Body(String, String, usize),
+    Body(String, String, usize, Option<Duration>),
     Handled(u16, String, String, usize),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HttpVerb {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+    Head,
+    Options,
+}
+
+// Convert from a string slice to the Enum
+impl FromStr for HttpVerb {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "GET" => Ok(HttpVerb::Get),
+            "POST" => Ok(HttpVerb::Post),
+            "PUT" => Ok(HttpVerb::Put),
+            "DELETE" => Ok(HttpVerb::Delete),
+            "PATCH" => Ok(HttpVerb::Patch),
+            "HEAD" => Ok(HttpVerb::Head),
+            "OPTIONS" => Ok(HttpVerb::Options),
+            _ => Err(format!("Unsupported HTTP verb: {}", s)),
+        }
+    }
 }
 
 fn load_cert(path: &str) -> Result<CertificateDer<'static>, Error> {
@@ -207,7 +237,7 @@ async fn handle_conn(
         .context("Could not get the peer address")?
         .ip();
 
-    let (body_str, endpoint, bytes_read) =
+    let (body_str, endpoint, bytes_read, k8s_timeout) =
         match parse_http_request(stream).await? {
             ParseOutcome::Handled(
                 code,
@@ -237,10 +267,19 @@ async fn handle_conn(
 
                 return Ok(());
             },
-            ParseOutcome::Body(body, endpoint, bytes_read) => {
-                (body, endpoint, bytes_read)
-            },
+            ParseOutcome::Body(
+                body,
+                endpoint,
+                bytes_read,
+                k8s_timeout,
+            ) => (body, endpoint, bytes_read, k8s_timeout),
         };
+
+    let ldap_timeout = ldap_connector.get_timeout();
+    let effective_timeout = match k8s_timeout {
+        Some(k8s_timeout) => Some(k8s_timeout.min(ldap_timeout)),
+        None => None,
+    };
 
     let token_review_str = tokio::select! {
         token_review_str = handle_tokenreview_request(&body_str, &ldap_connector) => {
@@ -248,6 +287,14 @@ async fn handle_conn(
         }
 
         _ = _check_remote_peer(stream, &peer_addr, endpoint.clone()) => {
+            return Ok(());
+        }
+
+        _ = async {
+            tokio::time::sleep(effective_timeout.unwrap()).await
+        }, if effective_timeout.is_some()  => {
+            tracing::warn!("{} - {} - {} {} - {} - {:?}", peer_addr, 504, "POST", endpoint, bytes_read, effective_timeout.unwrap());
+            _send_response(stream, 504, b"").await?;
             return Ok(());
         }
     };
@@ -313,34 +360,15 @@ async fn parse_http_request(
     let request_str =
         String::from_utf8_lossy(&raw_request[..header_end]);
 
-    let (method, endpoint) = request_str
-        .lines()
-        .next()
-        .and_then(|line| {
-            let method = line.split(' ').nth(0).unwrap_or("UNKNOWN");
-            let endpoint = line
-                .split(' ')
-                .nth(1)
-                .map(|endpoint| {
-                    if !endpoint.starts_with('/') {
-                        let endpoint = String::from("/") + endpoint;
-                        endpoint
-                    } else {
-                        endpoint.to_string()
-                    }
-                })
-                .unwrap_or("UNKNOWN".to_string());
+    let (method, endpoint, k8s_timeout) =
+        _extract_method_endpoint_timeout_url(&request_str);
 
-            Some((method.to_string(), endpoint))
-        })
-        .unwrap_or(("UNKNOWN".to_string(), "UNKNOWN".to_string()));
-
-    if endpoint == "UNKNOWN" {
+    if endpoint == "UNKNOWN" || method == "UNKNOWN" {
         _send_response(stream, 400, b"").await?;
         return Ok(ParseOutcome::Handled(
             400,
-            endpoint,
-            method,
+            String::from("UNKNOWN"),
+            String::from("UNKNOWN"),
             raw_request.len() - header_end,
         ));
     } else if endpoint != "/authenticate" {
@@ -395,13 +423,70 @@ async fn parse_http_request(
         )
         .into_owned();
 
-        Ok(ParseOutcome::Body(body_str, endpoint, content_length))
+        Ok(ParseOutcome::Body(
+            body_str,
+            endpoint,
+            content_length,
+            k8s_timeout,
+        ))
     } else {
         _send_response(stream, 411, b"").await?;
         return Ok(ParseOutcome::Handled(
             411, endpoint, method, header_end,
         ));
     }
+}
+
+fn _extract_method_endpoint_timeout_url(
+    request_str: &str,
+) -> (String, String, Option<Duration>) {
+    request_str
+        .lines()
+        .next()
+        .and_then(|line| {
+            let method = line
+                .split(' ')
+                .nth(0)
+                .and_then(|incoming| {
+                    if let Ok(_) = HttpVerb::from_str(incoming) {
+                        Some(incoming)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("UNKNOWN");
+            let (endpoint, k8s_timeout) = line
+                .split(' ')
+                .nth(1)
+                .map(|endpoint| {
+                    // Get query from URI
+                    let (path, query) = endpoint
+                        .split_once('?')
+                        .unwrap_or((endpoint, ""));
+                    let k8s_timeout =
+                        query.split('&').find_map(|pair| {
+                            let (k, v) = pair.split_once('=')?;
+                            if k == "timeout" {
+                                _parse_k8s_duration(v)
+                            } else {
+                                None
+                            }
+                        });
+                    if !path.starts_with('/') {
+                        (String::from("/") + path, k8s_timeout)
+                    } else {
+                        (path.to_string(), k8s_timeout)
+                    }
+                })
+                .unwrap_or(("UNKNOWN".to_string(), None));
+
+            Some((method.to_string(), endpoint, k8s_timeout))
+        })
+        .unwrap_or((
+            "UNKNOWN".to_string(),
+            "UNKNOWN".to_string(),
+            None,
+        ))
 }
 
 async fn _check_remote_peer(
@@ -541,6 +626,7 @@ async fn _send_response(
         411 => b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n",
         413 => b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n",
         500 => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+        504 => b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n",
         _ => b"",
     };
 
@@ -549,6 +635,20 @@ async fn _send_response(
     stream.shutdown().await?;
 
     Ok(())
+}
+
+fn _parse_k8s_duration(timeout: &str) -> Option<Duration> {
+    if let Some(time) = timeout.strip_suffix("ms") {
+        time.parse::<u64>().ok().map(Duration::from_millis)
+    } else if let Some(time) = timeout.strip_suffix('s') {
+        time.parse::<u64>().ok().map(Duration::from_secs)
+    } else if let Some(time) = timeout.strip_suffix('m') {
+        time.parse::<u64>()
+            .ok()
+            .map(|m| Duration::from_secs(m * 60))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -598,6 +698,10 @@ mod tests {
         fn get_attrs(&self) -> &HashMap<String, String> {
             &self.attrs
         }
+
+        fn get_timeout(&self) -> Duration {
+            Duration::from_secs(10)
+        }
     }
 
     struct LdapTestPeerReset {
@@ -622,6 +726,10 @@ mod tests {
 
         fn get_attrs(&self) -> &HashMap<String, String> {
             &self.attrs
+        }
+
+        fn get_timeout(&self) -> Duration {
+            Duration::from_secs(10)
         }
     }
 
@@ -832,6 +940,35 @@ mod tests {
         })
     }
 
+    #[fixture]
+    fn get_server_test_timeouts() -> u16 {
+        let rt = get_runtime();
+
+        rt.block_on(async {
+            let random_port = random_free_tcp_port().unwrap();
+
+            let cert_path = PathBuf::from(temp_dir()).join("webhook-server.pem");
+            let key_path = PathBuf::from(temp_dir()).join("webhook-server.key");
+
+            let ldap_connector_sleep = Arc::new(LdapTestPeerReset {
+                result: Ok(make_entry("uid=johndoe,cn=users,cn=accounts,dc=example,dc=test", HashMap::new())),
+                attrs: HashMap::new()
+            });
+
+            tokio::spawn(start_server(String::from("127.0.0.1"),
+                random_port,
+                String::from(key_path.to_string_lossy().into_owned()),
+                String::from(cert_path.to_string_lossy().into_owned()),
+                String::from(cert_path.to_string_lossy().into_owned()),
+                ldap_connector_sleep
+            ));
+
+            wait_server_is_alive(random_port).await;
+
+            random_port
+        })
+    }
+
     async fn get_tls_connector(
         target_addr: String,
         config: ClientConfig,
@@ -895,6 +1032,31 @@ mod tests {
             Host: 127.0.0.1\r\n\
             Connection: close\r\n\
             Content-Length: {}\r\n\r\n{}",
+            payload.len(),
+            payload
+        )
+    }
+
+    fn get_request_for_test_with_path(
+        token: &str,
+        path: &str,
+    ) -> String {
+        let payload = format!(
+            r#"
+                {{
+                    "apiVersion":"authentication.k8s.io/v1",
+                    "kind":"TokenReview",
+                    "spec":{{
+                        "token":"{}",
+                        "audiences": ["https://example.test", "https://internal.example.test"]
+                    }}
+                }}
+            "#,
+            token
+        );
+        format!(
+            "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+            path,
             payload.len(),
             payload
         )
@@ -1016,36 +1178,17 @@ mod tests {
     #[rstest]
     fn test_server_reset_peer(
         #[future] get_client_config: Result<ClientConfig>,
+        get_server_test_timeouts: u16,
     ) -> Result<()> {
         run_async_test!(
 
-            let random_port =  random_free_tcp_port().unwrap();
-
-            let cert_path = PathBuf::from(temp_dir()).join("webhook-server.pem");
-            let key_path = PathBuf::from(temp_dir()).join("webhook-server.key");
-
-            let ldap_connector_sleep = Arc::new(LdapTestPeerReset {
-                result: Ok(make_entry("uid=johndoe,cn=users,cn=accounts,dc=example,dc=test", HashMap::new())),
-                attrs: HashMap::new()
-            });
-
-            tokio::spawn(start_server(String::from("127.0.0.1"),
-                random_port,
-                String::from(key_path.to_string_lossy().into_owned()),
-                String::from(cert_path.to_string_lossy().into_owned()),
-                String::from(cert_path.to_string_lossy().into_owned()),
-                ldap_connector_sleep
-            ));
-
-            wait_server_is_alive(random_port).await;
-
-            let target_addr = format!("{}:{}", "127.0.0.1", random_port);
+            let target_addr = format!("{}:{}", "127.0.0.1", get_server_test_timeouts);
 
             let config = get_client_config.await?;
 
             let mut tls_stream = get_tls_connector(target_addr, config).await?;
 
-            let request = get_request_for_test("dGhpYWdvY2FzdHJvbzp0ZXN0ZQ==");
+            let request = get_request_for_test("am9obmRvZTpwYXNzd29yZA==");
 
             tls_stream.write_all(request.as_bytes()).await?;
             tls_stream.shutdown().await?;
@@ -1102,6 +1245,129 @@ mod tests {
             Ok(())
 
         )
+    }
+
+    #[rstest]
+    fn test_server_valid_user_with_query_param(
+        #[future] get_tls_stream: Result<TlsStream<TcpStream>>,
+    ) {
+        run_async_test!(
+            let tls_stream = get_tls_stream.await.unwrap();
+            let request = get_request_for_test_with_path("am9obmRvZTpwYXNzd29yZA==", "/authenticate?timeout=30s");
+            let response = get_response(&request, tls_stream).await.unwrap();
+            assert!(String::from_utf8(response).unwrap().starts_with("HTTP/1.1 200 OK"));
+        )
+    }
+
+    #[rstest]
+    #[case("30s", Some(Duration::from_secs(30)))]
+    #[case("500ms", Some(Duration::from_millis(500)))]
+    #[case("2m", Some(Duration::from_secs(120)))]
+    #[case("", None)]
+    #[case("abc", None)]
+    fn test_server_parse_k8s_duration(
+        #[case] input: &str,
+        #[case] expected: Option<Duration>,
+    ) {
+        assert_eq!(_parse_k8s_duration(input), expected);
+    }
+
+    #[rstest]
+    fn test_server_timeout(
+        #[future] get_client_config: Result<ClientConfig>,
+        get_server_test_timeouts: u16,
+    ) -> Result<()> {
+        run_async_test!(
+
+            let target_addr = format!("{}:{}", "127.0.0.1", get_server_test_timeouts);
+
+            let config = get_client_config.await?;
+
+            let tls_stream = get_tls_connector(target_addr, config).await?;
+
+            let request = get_request_for_test_with_path("am9obmRvZTpwYXNzd29yZA==", "/authenticate?timeout=1s");
+
+            let response = get_response(&request, tls_stream).await?;
+
+            assert_eq!(response, b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n");
+
+            Ok(())
+        )
+    }
+
+    #[rstest]
+    fn test_server_method_not_allowed(
+        #[future] get_tls_stream: Result<TlsStream<TcpStream>>,
+    ) -> Result<()> {
+        run_async_test!(
+            let tls_stream = get_tls_stream.await?;
+            let request = "GET /authenticate HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+            let response = get_response(&request, tls_stream).await?;
+            assert_eq!(response, b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
+            Ok(())
+        )
+    }
+
+    #[rstest]
+    fn test_server_400_malformed_request_line(
+        #[future] get_tls_stream: Result<TlsStream<TcpStream>>,
+    ) -> Result<()> {
+        run_async_test!(
+            let tls_stream = get_tls_stream.await?;
+            let request = "NOTAVERB /authenticate HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}";
+            let response = get_response(&request, tls_stream).await?;
+            assert_eq!(response, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            Ok(())
+        )
+    }
+
+    #[rstest]
+    fn test_server_no_timeout_param_gets_normal_response(
+        #[future] get_client_config: Result<ClientConfig>,
+        get_server_test_timeouts: u16,
+    ) -> Result<()> {
+        run_async_test!(
+            let target_addr = format!("{}:{}", "127.0.0.1", get_server_test_timeouts);
+            let config = get_client_config.await?;
+            let tls_stream = get_tls_connector(target_addr, config).await?;
+            let request = get_request_for_test("am9obmRvZTpwYXNzd29yZA==");
+            let response = get_response(&request, tls_stream).await?;
+            assert!(String::from_utf8(response).unwrap().starts_with("HTTP/1.1 200 OK"));
+            Ok(())
+        )
+    }
+
+    #[rstest]
+    fn test_server_query_string_multiple_params(
+        #[future] get_tls_stream: Result<TlsStream<TcpStream>>,
+    ) {
+        run_async_test!(
+            let tls_stream = get_tls_stream.await.unwrap();
+            let request = get_request_for_test_with_path(
+                "am9obmRvZTpwYXNzd29yZA==",
+                "/authenticate?foo=bar&timeout=30s&baz=qux"
+            );
+            let response = get_response(&request, tls_stream).await.unwrap();
+            assert!(String::from_utf8(response).unwrap().starts_with("HTTP/1.1 200 OK"));
+        )
+    }
+
+    #[rstest]
+    #[case("POST /authenticate HTTP/1.1", ("POST", "/authenticate", None))]
+    #[case("POST /authenticate?timeout=30s HTTP/1.1", ("POST", "/authenticate", Some(Duration::from_secs(30))))]
+    #[case("POST /authenticate?foo=bar&timeout=5s HTTP/1.1", ("POST", "/authenticate", Some(Duration::from_secs(5))))]
+    #[case("GET / HTTP/1.1", ("GET", "/", None))]
+    #[case("NOTAVERB /authenticate HTTP/1.1", ("UNKNOWN", "/authenticate", None))]
+    #[case("", ("UNKNOWN", "UNKNOWN", None))]
+    fn test_server_extract_method_endpoint_timeout(
+        #[case] input: &str,
+        #[case] expected: (&str, &str, Option<Duration>),
+    ) {
+        let (method, endpoint, timeout) =
+            _extract_method_endpoint_timeout_url(input);
+        assert_eq!(method, expected.0);
+        assert_eq!(endpoint, expected.1);
+        assert_eq!(timeout, expected.2);
     }
 
     #[dtor(unsafe)]

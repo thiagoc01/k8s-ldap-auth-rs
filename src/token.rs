@@ -187,6 +187,7 @@ mod tests {
     use rstest::*;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::*;
 
@@ -210,6 +211,10 @@ mod tests {
 
         fn get_attrs(&self) -> &HashMap<String, String> {
             &self.attrs
+        }
+
+        fn get_timeout(&self) -> Duration {
+            Duration::from_secs(10)
         }
     }
 

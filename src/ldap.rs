@@ -55,6 +55,7 @@ pub trait LdapBackend: Send + Sync {
     ) -> Result<SearchEntry>;
 
     fn get_attrs(&self) -> &HashMap<String, String>;
+    fn get_timeout(&self) -> Duration;
 }
 
 pub struct LdapConnector {
@@ -63,6 +64,7 @@ pub struct LdapConnector {
     bind_password: String,
     search_base: String,
     ldap_conn_settings: LdapConnSettings,
+    timeout: Duration,
     search_filter: String,
     /*
         The attributes are modelled as hashmap since the field
@@ -155,6 +157,7 @@ impl LdapConnector {
             bind_password: ldap_args.ldap_bind_password,
             search_base: ldap_args.ldap_search_base,
             ldap_conn_settings,
+            timeout,
             search_filter,
             attrs,
         })
@@ -352,6 +355,10 @@ impl LdapBackend for LdapConnector {
 
     fn get_attrs(&self) -> &HashMap<String, String> {
         &self.attrs
+    }
+
+    fn get_timeout(&self) -> Duration {
+        self.timeout
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "k8s-ldap-auth-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A webhook authentication server for a Kubernetes cluster"
 keywords = ["kubernetes", "k8s", "webhook-authentication", "rust", "ldap"]
