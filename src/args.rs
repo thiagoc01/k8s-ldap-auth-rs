@@ -494,22 +494,7 @@ mod tests {
     }
 
     unsafe fn clear_env() {
-        for key in &[
-            "K8S_LDAP_AUTH_KEY_PATH",
-            "K8S_LDAP_AUTH_CERT_PATH",
-            "K8S_LDAP_AUTH_CA_CERT_PATH",
-            "K8S_LDAP_AUTH_LDAP_URL",
-            "K8S_LDAP_AUTH_LDAP_BIND_USER",
-            "K8S_LDAP_AUTH_LDAP_BIND_PASSWORD",
-            "K8S_LDAP_AUTH_LDAP_SEARCH_BASE",
-            "K8S_LDAP_AUTH_LOG_LEVEL",
-            "K8S_LDAP_AUTH_LDAP_CA_CERT_PATH",
-            "K8S_LDAP_AUTH_LDAP_SEARCH_ATTRS",
-            "K8S_LDAP_AUTH_LDAP_TIMEOUT_CONN",
-            "K8S_LDAP_AUTH_LDAP_USER_ATTR",
-            "K8S_LDAP_AUTH_LOG_FILE_PATH",
-            "K8S_LDAP_AUTH_LDAP_TOKEN_ATTR",
-        ] {
+        for (key, _) in &POSSIBLE_ENV_VARS {
             unsafe { env::remove_var(key) };
         }
     }

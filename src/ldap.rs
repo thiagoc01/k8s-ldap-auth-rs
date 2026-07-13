@@ -691,15 +691,15 @@ mod tests_ldap_ext {
                 .with_network("bridge")
                 .with_copy_to(
                     "/container/service/slapd/assets/config/bootstrap/ldif/1-ad-schema.ldif",
-                    Path::new("./tests/schema.ldif"),
+                    Path::new("./tests-fixtures/schema.ldif"),
                 )
                 .with_copy_to(
                     "/container/service/slapd/assets/config/bootstrap/ldif/2-bootstrap.ldif",
-                    Path::new("./tests/entries.ldif"),
+                    Path::new("./tests-fixtures/entries.ldif"),
                 )
                 .with_copy_to(
                     "/container/service/slapd/assets/config/bootstrap/ldif/3-index.ldif",
-                    Path::new("./tests/index-samaccountname.ldif"),
+                    Path::new("./tests-fixtures/index-samaccountname.ldif"),
                 )
                 .with_copy_to(
                     "/container/service/slapd/assets/certs/webhook-server.pem",
