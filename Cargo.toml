@@ -1,6 +1,6 @@
 [package]
 name = "k8s-ldap-auth-rs"
-version = "0.4.1"
+version = "1.0.0"
 edition = "2024"
 description = "A webhook authentication server for a Kubernetes cluster"
 keywords = ["kubernetes", "k8s", "webhook-authentication", "rust", "ldap"]
@@ -17,6 +17,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+hex-literal = "1.1"
 anyhow = "1.0"
 rustls-pki-types = "1.13"
 k8s-openapi = { version = "0.27", features = ["v1_35"] }
@@ -27,6 +28,7 @@ async-trait = "0.1"
 native-tls = "0.2"
 testcontainers = { version = "0.27", optional = true, features = ["host-port-exposure"] }
 rcgen = "0.14"
+sha2 = "0.11"
 tracing = { version = "0.1", features = ["max_level_debug", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 

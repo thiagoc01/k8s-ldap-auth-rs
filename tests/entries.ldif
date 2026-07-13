@@ -17,6 +17,7 @@ ou: sysaccounts
 
 # --- valid user, member of two groups ---
 dn: uid=johndoe,ou=users,dc=example,dc=test
+objectClass: k8sAuthToken
 objectClass: inetOrgPerson
 objectClass: posixAccount
 objectClass: shadowAccount
@@ -30,9 +31,44 @@ gidNumber: 10001
 homeDirectory: /home/johndoe
 memberOf: cn=k8s-admins,ou=groups,dc=example,dc=test
 memberOf: cn=infra,ou=groups,dc=example,dc=test
+k8sToken: sha256:c018911b1465b0a70f6ab1c5854544cd7bdd6e927a3a741f3dc654ee136a4969
+
+# --- user without k8sToken ---
+dn: uid=janedoe,ou=users,dc=example,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+uid: janedoe
+cn: Jane Doe
+sn: Doe
+mail: jane@example.test
+userPassword: janedoepass
+uidNumber: 10004
+gidNumber: 10004
+homeDirectory: /home/janedoe
+memberOf: cn=k8s-admins,ou=groups,dc=example,dc=test
+memberOf: cn=infra,ou=groups,dc=example,dc=test
+
+# --- user with k8sToken2 ---
+dn: uid=johnsmith,ou=users,dc=example,dc=test
+objectClass: inetOrgPerson
+objectClass: k8sAuthToken2
+objectClass: posixAccount
+objectClass: shadowAccount
+uid: johnsmith
+cn: John Smith
+sn: Smith
+mail: johnsmith@example.test
+userPassword: johnsmithpass
+k8sToken2: sha512:d2d73ce115cddf533fba917645b9607923d9f0ec54b270d89d348e678400f187d7be9d7ba45d2a4ee68b6f7a94a56feb13457f56063a64ac1e0233c9f16ebcb4
+uidNumber: 10005
+gidNumber: 10005
+homeDirectory: /home/johnsmith
+memberOf: cn=k8s-admins,ou=groups,dc=example,dc=test
 
 # --- valid user, single group ---
 dn: uid=alicecooper,ou=users,dc=example,dc=test
+objectClass: k8sAuthToken
 objectClass: inetOrgPerson
 objectClass: posixAccount
 objectClass: shadowAccount
@@ -46,9 +82,11 @@ userPassword: alicecooperpass
 uidNumber: 10002
 gidNumber: 10002
 homeDirectory: /home/alicecooper
+k8sToken: sha512:824c9396f99f3d3de2ff105660005bc06bd73bf50f125e61b56f4238637cc1a946b476325a5d1452edc8a2731a4ef1237fd8e9278092ff024eb869ed17bbaa58
 
 # --- duplicate uid in another subtree: tests ambiguous search results ---
 dn: uid=johndoe,ou=sysaccounts,dc=example,dc=test
+objectClass: k8sAuthToken
 objectClass: inetOrgPerson
 objectClass: posixAccount
 objectClass: shadowAccount
@@ -59,6 +97,7 @@ uidNumber: 10003
 gidNumber: 10003
 userPassword: johndoesysaccount
 homeDirectory: /home/johndoe
+k8sToken: sha256:e87a77c34a03a8924a5d0986b7a66c485ba0016161df7c80b4c806a4dbb12d2f
 
 dn: cn=k8s-admins,ou=groups,dc=example,dc=test
 objectClass: groupOfNames

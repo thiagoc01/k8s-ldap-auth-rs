@@ -687,7 +687,7 @@ mod tests {
         async fn search_user(
             &self,
             _user: &str,
-            _pass: &str,
+            _secret: &str,
         ) -> anyhow::Result<SearchEntry> {
             self.result
                 .as_ref()
@@ -714,7 +714,7 @@ mod tests {
         async fn search_user(
             &self,
             _user: &str,
-            _pass: &str,
+            _secret: &str,
         ) -> anyhow::Result<SearchEntry> {
             sleep(Duration::from_secs(5)).await; // Simulates server not responding
 

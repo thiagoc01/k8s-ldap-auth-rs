@@ -10,35 +10,35 @@ use std::sync::Arc;
 
 use crate::ldap::LdapBackend;
 
-fn retrieve_user_pass_from_token(
+fn retrieve_user_secret_from_token(
     token_base64: Option<String>,
 ) -> Result<(String, String)> {
     let base64_decoder = base64::engine::general_purpose::STANDARD;
 
-    let user_pass = if let Some(token_base64) = token_base64 {
-        let Ok(user_pass) = base64_decoder.decode(token_base64)
+    let user_secret = if let Some(token_base64) = token_base64 {
+        let Ok(user_secret) = base64_decoder.decode(token_base64)
         else {
             return Err(Error::msg(
                 "Error token not provided in request",
             ));
         };
 
-        user_pass
+        user_secret
     } else {
         return Err(Error::msg(
             "Error reading token provided in request",
         ));
     };
 
-    let user_pass = String::from_utf8(user_pass)
+    let user_secret = String::from_utf8(user_secret)
         .context("Error converting token to UTF-8 string")?;
 
-    let (user, password) =
-        user_pass.split_once(':').ok_or_else(|| {
-            Error::msg("Token is not a <user>:<password> string")
+    let (user, secret) =
+        user_secret.split_once(':').ok_or_else(|| {
+            Error::msg("Token is not a <user>:<secret> string")
         })?;
 
-    Ok((user.to_owned(), password.to_owned()))
+    Ok((user.to_owned(), secret.to_owned()))
 }
 
 fn create_tokenreview_status(
@@ -143,13 +143,13 @@ pub async fn handle_tokenreview_request(
 
     let audiences = token_review_req.spec.audiences.clone();
 
-    let (user, password) = retrieve_user_pass_from_token(
+    let (user, secret) = retrieve_user_secret_from_token(
         token_review_req.spec.token.clone(),
     )
-    .context("Error retrieving user and password from token")?;
+    .context("Error retrieving user and secret from token")?;
 
     token_review_req.status =
-        match ldap_connector.search_user(&user, &password).await {
+        match ldap_connector.search_user(&user, &secret).await {
             Ok(search_entry) => create_tokenreview_status(
                 Some(search_entry),
                 audiences,
@@ -201,7 +201,7 @@ mod tests {
         async fn search_user(
             &self,
             _user: &str,
-            _pass: &str,
+            _secret: &str,
         ) -> anyhow::Result<SearchEntry> {
             self.result
                 .as_ref()

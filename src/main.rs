@@ -8,7 +8,7 @@ mod ldap;
 mod logging;
 mod token;
 
-const VERSION: &str = "v0.4.1";
+const VERSION: &str = "v1.0.0";
 
 #[tokio::main]
 async fn main() {

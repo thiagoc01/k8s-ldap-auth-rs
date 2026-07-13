@@ -5,6 +5,7 @@ use ldap3::{
     SearchEntry,
 };
 use native_tls::{Certificate, TlsConnector};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -22,6 +23,7 @@ pub struct LdapArgs {
     search_attrs: String,
     ldap_timeout_conn: String,
     ldap_cacert_file_path: Option<String>,
+    ldap_token_attr: String,
 }
 
 impl LdapArgs {
@@ -34,6 +36,7 @@ impl LdapArgs {
         search_attrs: String,
         ldap_timeout_conn: String,
         ldap_cacert_file_path: Option<String>,
+        ldap_token_attr: String,
     ) -> Self {
         Self {
             ldap_url,
@@ -44,6 +47,7 @@ impl LdapArgs {
             search_attrs,
             ldap_timeout_conn,
             ldap_cacert_file_path,
+            ldap_token_attr,
         }
     }
 }
@@ -53,7 +57,7 @@ pub trait LdapBackend: Send + Sync {
     async fn search_user(
         &self,
         user: &str,
-        password: &str,
+        secret: &str,
     ) -> Result<SearchEntry>;
 
     fn get_attrs(&self) -> &HashMap<String, String>;
@@ -78,6 +82,7 @@ pub struct LdapConnector {
         When performing the search, the values are passed for the request
     */
     attrs: HashMap<String, String>,
+    ldap_token_attr: String,
 }
 
 impl LdapConnector {
@@ -162,6 +167,7 @@ impl LdapConnector {
             timeout,
             search_filter,
             attrs,
+            ldap_token_attr: ldap_args.ldap_token_attr,
         })
     }
 
@@ -184,7 +190,7 @@ impl LdapConnector {
     pub async fn search_user(
         &self,
         user: &str,
-        password: &str,
+        secret: &str,
     ) -> Result<SearchEntry> {
         let (conn, mut ldap) =
             self.create_ldap_conn_handle().await.context(
@@ -221,6 +227,11 @@ impl LdapConnector {
 
         let final_filter = self.search_filter.replace("{}", user);
 
+        let mut ldap_search_attrs =
+            self.attrs.values().collect::<Vec<&String>>();
+
+        ldap_search_attrs.push(&self.ldap_token_attr);
+
         let time_before_search = Instant::now();
 
         let (mut results, _) = match ldap
@@ -228,7 +239,7 @@ impl LdapConnector {
                 &self.search_base,
                 Scope::Subtree,
                 &final_filter,
-                &self.attrs.values().collect::<Vec<&String>>(),
+                ldap_search_attrs,
             )
             .await?
             .success()
@@ -263,25 +274,26 @@ impl LdapConnector {
         let user_ldap = if let Some(entry) = results.pop() {
             let search_entry = SearchEntry::construct(entry);
 
-            match ldap
-                .simple_bind(&search_entry.dn, password)
-                .await?
-                .success()
-            {
-                Ok(_) => Ok(search_entry),
+            let stored_token = search_entry
+                .attrs
+                .get(&self.ldap_token_attr)
+                .and_then(|values| values.first())
+                .ok_or_else(|| {
+                    self.format_log_ldap_error(format!(
+                        "LDAP attribute {} not found for user {}",
+                        &self.ldap_token_attr, user
+                    ))
+                })?;
 
-                Err(LdapError::LdapResult { result }) => {
-                   Err(self.format_log_ldap_error(format!(
-                            "LDAP authentication failed for {}. Reason: {}",
-                            &user,
-                            self.ldap_rc_to_str(result.rc)
-                        )))
-                },
-
-                Err(error) => {
-                    tracing::debug!("LDAP authentication failed. {}", logging::format_error_chain(&error));
-                    Err(Error::msg(format!("LDAP authentication failed")))
-                }
+            if verify_token(secret, stored_token) {
+                let mut search_entry = search_entry; // Remove token from attrs as it must not be in TokenReview
+                search_entry.attrs.remove(&self.ldap_token_attr);
+                Ok(search_entry)
+            } else {
+                Err(self.format_log_ldap_error(format!(
+                    "LDAP authentication failed for {}. Reason: Invalid Credentials",
+                    user
+                )))
             }
         } else {
             Err(Error::msg(format!("LDAP user {} not found", user)))
@@ -354,14 +366,49 @@ fn load_ca_certificate_ldap(path: &str) -> Result<Certificate> {
     Ok(cert)
 }
 
+pub fn encode_hex(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+fn check_hashs_constant_time(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+pub fn verify_token(secret: &str, stored: &str) -> bool {
+    if let Some(hash) = stored.strip_prefix("sha256:") {
+        let computed = encode_hex(&Sha256::digest(secret.as_bytes()));
+        check_hashs_constant_time(
+            computed.as_bytes(),
+            hash.as_bytes(),
+        )
+    } else if let Some(hash) = stored.strip_prefix("sha512:") {
+        let computed = encode_hex(&Sha512::digest(secret.as_bytes()));
+        check_hashs_constant_time(
+            computed.as_bytes(),
+            hash.as_bytes(),
+        )
+    } else {
+        tracing::warn!(
+            "k8sToken has unknown format, expected sha256: or sha512: prefix"
+        );
+        false
+    }
+}
+
 #[async_trait]
 impl LdapBackend for LdapConnector {
     async fn search_user(
         &self,
         user: &str,
-        password: &str,
+        secret: &str,
     ) -> Result<SearchEntry> {
-        self.search_user(user, password).await
+        self.search_user(user, secret).await
     }
 
     fn get_attrs(&self) -> &HashMap<String, String> {
@@ -392,6 +439,7 @@ mod tests {
             "".to_string(),
             "40".to_string(),
             None,
+            "k8sToken".to_string(),
         )
     }
 
@@ -447,6 +495,15 @@ mod tests {
         get_base_ldap_args.ldap_url = "ldaps://localhost".to_string();
         get_base_ldap_args.ldap_cacert_file_path =
             Some("".to_string());
+        get_base_ldap_args
+    }
+
+    #[fixture]
+    fn get_base_ldap_args_custom_token_attr(
+        mut get_base_ldap_args: LdapArgs,
+    ) -> LdapArgs {
+        get_base_ldap_args.ldap_token_attr =
+            "kubernetesWebhookAuthToken".to_string();
         get_base_ldap_args
     }
 
@@ -515,6 +572,16 @@ mod tests {
             LdapConnector::new(get_base_ldap_args_user_attr).unwrap();
         assert_eq!(c.search_filter, "(sAMAccountName={})");
     }
+
+    #[rstest]
+    fn test_ldap_custom_token_attr(
+        get_base_ldap_args_custom_token_attr: LdapArgs,
+    ) {
+        let c =
+            LdapConnector::new(get_base_ldap_args_custom_token_attr)
+                .unwrap();
+        assert_eq!(c.ldap_token_attr, "kubernetesWebhookAuthToken");
+    }
 }
 
 #[cfg(all(test, feature = "tests-ldap-ext"))]
@@ -551,6 +618,7 @@ mod tests_ldap_ext {
             search_attrs: "".to_string(),
             ldap_timeout_conn: "40".to_string(),
             ldap_cacert_file_path: None,
+            ldap_token_attr: "k8sToken".to_string(),
         }
     }
 
@@ -623,7 +691,7 @@ mod tests_ldap_ext {
                 .with_network("bridge")
                 .with_copy_to(
                     "/container/service/slapd/assets/config/bootstrap/ldif/1-ad-schema.ldif",
-                    Path::new("./tests/ad-schema.ldif"),
+                    Path::new("./tests/schema.ldif"),
                 )
                 .with_copy_to(
                     "/container/service/slapd/assets/config/bootstrap/ldif/2-bootstrap.ldif",
@@ -856,6 +924,92 @@ mod tests_ldap_ext {
         assert_eq!(
             entry.err().unwrap().to_string(),
             "LDAP user alicecooper not found"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_user_without_k8s_token(
+        mut get_base_ldap_args: LdapArgs,
+    ) {
+        let container = get_container_tests().await;
+        let port =
+            container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path =
+            CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url =
+            format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.ldap_search_base =
+            "ou=users,dc=example,dc=test".to_string();
+
+        let connector =
+            LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry =
+            connector.search_user("janedoe", "janedoepass").await;
+        assert_eq!(
+            entry.err().unwrap().to_string(),
+            "LDAP attribute k8sToken not found for user janedoe"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_user_token_different_name(
+        mut get_base_ldap_args: LdapArgs,
+    ) {
+        let container = get_container_tests().await;
+        let port =
+            container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path =
+            CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url =
+            format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.ldap_search_base =
+            "ou=users,dc=example,dc=test".to_string();
+        get_base_ldap_args.ldap_token_attr = "k8sToken2".to_string();
+
+        let connector =
+            LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry =
+            connector.search_user("johnsmith", "johnsmithpass").await;
+        assert_eq!(
+            entry.ok().unwrap().dn,
+            "uid=johnsmith,ou=users,dc=example,dc=test"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ldap_ext_user_without_token_different_name(
+        mut get_base_ldap_args: LdapArgs,
+    ) {
+        let container = get_container_tests().await;
+        let port =
+            container.get_host_port_ipv4(LDAPS_PORT).await.unwrap();
+
+        let cert_path =
+            CERTS.get().unwrap().as_ref().unwrap().to_owned().0;
+
+        get_base_ldap_args.ldap_url =
+            format!("ldaps://127.0.0.1:{}", port);
+        get_base_ldap_args.ldap_cacert_file_path = Some(cert_path);
+        get_base_ldap_args.ldap_search_base =
+            "ou=users,dc=example,dc=test".to_string();
+        get_base_ldap_args.ldap_token_attr = "k8sToken2".to_string();
+
+        let connector =
+            LdapConnector::new(get_base_ldap_args).unwrap();
+        let entry =
+            connector.search_user("janedoe", "janedoepass").await;
+        assert_eq!(
+            entry.err().unwrap().to_string(),
+            "LDAP attribute k8sToken2 not found for user janedoe"
         );
     }
 

@@ -14,7 +14,7 @@ pub enum LogLevel {
     ERROR,
 }
 
-pub const POSSIBLE_ENV_VARS: [(&str, &str); 13] = [
+pub const POSSIBLE_ENV_VARS: [(&str, &str); 14] = [
     ("K8S_LDAP_AUTH_KEY_PATH", "./pki/server/webhook-server.key"),
     ("K8S_LDAP_AUTH_CERT_PATH", "./pki/server/webhook-server.pem"),
     ("K8S_LDAP_AUTH_CA_CERT_PATH", "./pki/ca/ca.crt"),
@@ -28,6 +28,7 @@ pub const POSSIBLE_ENV_VARS: [(&str, &str); 13] = [
     ("K8S_LDAP_AUTH_LDAP_TIMEOUT_CONN", "40"),
     ("K8S_LDAP_AUTH_LDAP_USER_ATTR", "uid"),
     ("K8S_LDAP_AUTH_LOG_FILE_PATH", "None"),
+    ("K8S_LDAP_AUTH_LDAP_TOKEN_ATTR", "k8sToken"),
 ];
 
 pub struct Args {
@@ -189,6 +190,11 @@ impl Args {
                 matches
                     .try_get_one::<String>("ldap-cacert-path")
                     .map_or(None, |path| path.cloned()),
+                Self::save_arg(
+                    &matches,
+                    "ldap-token-attr",
+                    |ldap_token_attr: String| ldap_token_attr,
+                ),
             ),
         })
     }
@@ -413,6 +419,15 @@ impl Args {
                     .num_args(1)
                     .long("ldap-cacert-path")
                     .help("Path to the LDAP CA file to check the LDAP server"),
+            )
+            .arg(
+                Arg::new("ldap-token-attr")
+                .env("K8S_LDAP_AUTH_LDAP_TOKEN_ATTR")
+                .default_value("k8sToken")
+                .value_name("ATTR")
+                .num_args(1)
+                .long("ldap-token-attr")
+                .help("LDAP attribute containing the hashed token (sha256:<hash> or sha512:<hash>)")
             );
 
         command
@@ -493,6 +508,7 @@ mod tests {
             "K8S_LDAP_AUTH_LDAP_TIMEOUT_CONN",
             "K8S_LDAP_AUTH_LDAP_USER_ATTR",
             "K8S_LDAP_AUTH_LOG_FILE_PATH",
+            "K8S_LDAP_AUTH_LDAP_TOKEN_ATTR",
         ] {
             unsafe { env::remove_var(key) };
         }
@@ -551,7 +567,8 @@ mod tests {
                 "uid".to_string(),
                 "".to_string(),
                 "10".to_string(),
-                Some("ldap-ca.crt".to_string())
+                Some("ldap-ca.crt".to_string()),
+                "k8sToken".to_string()
             )
         );
     }
@@ -573,6 +590,8 @@ mod tests {
             "k8s_extra_sn:sn",
             "--ldap-search-attrs",
             "username:uid",
+            "--ldap-token-attr",
+            "k3sToken",
         ]);
 
         let ((ip, port), (key, cert, cacert), ldap_args, _, _) =
@@ -593,7 +612,8 @@ mod tests {
                 "uid".to_string(),
                 "k8s_extra_sn:sn,username:uid".to_string(),
                 "10".to_string(),
-                Some("/path/to/ca.crt".to_string())
+                Some("/path/to/ca.crt".to_string()),
+                "k3sToken".to_string()
             )
         );
     }
@@ -730,7 +750,8 @@ mod tests {
                 "uid".to_string(),
                 "".to_string(),
                 "10".to_string(),
-                None
+                None,
+                "k8sToken".to_string()
             )
         );
     }
@@ -756,7 +777,8 @@ mod tests {
                 "uid".to_string(),
                 "".to_string(),
                 "10".to_string(),
-                Some("/etc/ssl/ldap-ca.crt".to_string())
+                Some("/etc/ssl/ldap-ca.crt".to_string()),
+                "k8sToken".to_string()
             )
         );
     }
@@ -782,7 +804,8 @@ mod tests {
                 "uid".to_string(),
                 "".to_string(),
                 "30".to_string(),
-                None
+                None,
+                "k8sToken".to_string()
             )
         );
     }
@@ -810,6 +833,7 @@ mod tests {
             ("K8S_LDAP_AUTH_LDAP_TIMEOUT_CONN=9"),
             ("K8S_LDAP_AUTH_LOG_LEVEL=ERROR"),
             ("K8S_LDAP_AUTH_LOG_FILE_PATH=/var/log/k8s-ldap-auth.log"),
+            ("K8S_LDAP_AUTH_LDAP_TOKEN_ATTR=k3sToken"),
         ];
 
         for env_var in env_vars {
@@ -849,7 +873,8 @@ mod tests {
                 "sAMAccountName".to_string(),
                 "k8s_extra_cn:cn".to_string(),
                 "9".to_string(),
-                Some("env-file/ldap/ca.crt".to_string())
+                Some("env-file/ldap/ca.crt".to_string()),
+                "k3sToken".to_string()
             )
         );
 
