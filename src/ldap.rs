@@ -374,7 +374,7 @@ fn load_ca_certificate_ldap(path: &str) -> Result<Certificate> {
     Ok(cert)
 }
 
-pub fn encode_hex(value: &[u8]) -> String {
+fn encode_hex(value: &[u8]) -> String {
     value.iter().map(|byte| format!("{:02x}", byte)).collect()
 }
 

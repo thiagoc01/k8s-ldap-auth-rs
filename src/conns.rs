@@ -43,7 +43,7 @@ enum ParseOutcome {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum HttpVerb {
+enum HttpVerb {
     Get,
     Post,
     Put,
