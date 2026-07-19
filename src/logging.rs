@@ -1,3 +1,11 @@
+//! Controls the logging in [Stdout](std::io::Stdout) and [File](std::fs::File)
+//!
+//! It implements `tracing` and `tracing_subscriber` for the server logging and uses
+//! all the [Level] variants but [TRACE](tracing::Level::TRACE).
+//! It also formats the logging with useful data and information for several purposes.
+//! This implementation colors the output in terminals with ANSI support.
+//! But in files it keeps a standard plain uncolored text.
+
 use std::{fs::OpenOptions, io::Write, path::Path};
 
 use tracing_subscriber::{
@@ -16,6 +24,7 @@ use tracing::{Event, Level, Subscriber};
 
 use crate::args::{LogLevel, POSSIBLE_ENV_VARS};
 
+/// Number of spaces added per depth level in [format_error_chain].
 const BASE_IDENT_NUM_COLUMNS: u8 = 5;
 
 const BANNER: &str = concat!(
@@ -23,6 +32,11 @@ const BANNER: &str = concat!(
     "Version: "
 );
 
+/// Writes the startup banner to stdout and optionally to the log file.
+///
+/// Bypasses the tracing formatter entirely — no timestamp or level prefix.
+/// Must be called before [init_logging] if you want the banner to appear
+/// without formatting, or after if the subscriber is already set.
 pub fn print_banner(version: &str, log_path: Option<&Path>) {
     let banner = format!("{}{}\n\n", BANNER, version);
     print!("{}", banner);
@@ -44,6 +58,18 @@ fn convert_to_tracing_levels(level: &LogLevel) -> Level {
     }
 }
 
+/// Formats an error and its full [std::error::Error::source] chain with
+/// increasing indentation.
+///
+/// For errors with no source, wraps the message in a single "Caused by:" line.
+/// For chained errors, each level adds [BASE_IDENT_NUM_COLUMNS] spaces.
+///
+/// # Example
+/// ```
+/// // top error
+///      Caused by: mid error
+///           Caused by: root cause
+/// ```
 pub fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut out = err.to_string();
     let mut source = err.source();
@@ -98,6 +124,14 @@ impl FormatTime for LocalTimer {
     }
 }
 
+/// Initialises the global tracing subscriber.
+///
+/// Must be called exactly once per process. Subsequent calls are silently
+/// ignored via `try_init`. In test builds the stdout layer writes to
+/// [std::io::sink] to suppress output.
+///
+/// If `log_path` is provided but cannot be opened, falls back to stdout only
+/// and emits a warning.
 pub fn init_logging(
     level: &LogLevel,
     log_path: Option<&Path>,
@@ -175,6 +209,7 @@ pub fn init_logging(
     Ok(())
 }
 
+/// Formatter for logging in terminal with ANSI support
 struct ColouredFormatter;
 
 fn get_level_ansi(level: &tracing::Level) -> &'static str {
@@ -210,6 +245,8 @@ where
         writeln!(writer)
     }
 }
+
+/// Formatter for logging in files
 struct PlainFormatter;
 
 impl<S, N> FormatEvent<S, N> for PlainFormatter
@@ -241,8 +278,14 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use std::sync::{Arc, Mutex};
 
+/// Implementation for [Subscriber] writer to the file logging
+///
+/// It's a [std::fs::File] protected by a [Mutex] to be shared through threads
 struct SharedFile(Arc<Mutex<std::fs::File>>);
 
+/// [MakeWriter] impl that shares a single [std::fs::File] across log records
+/// via [`Arc<Mutex>`]. Required because tracing calls [`MakeWriter::make_writer`] on
+/// every event and [std::fs::File] is not [Clone].
 impl<'a> MakeWriter<'a> for SharedFile {
     type Writer = SharedFile;
     fn make_writer(&'a self) -> Self::Writer {

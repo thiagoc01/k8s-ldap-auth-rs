@@ -1,3 +1,5 @@
+//! Receives and parses the args from CLI and environment variables
+
 use anyhow::{Context, Result};
 use clap::{Arg, ArgMatches, Command};
 use dotenvy::from_filename_override;
@@ -14,6 +16,7 @@ pub enum LogLevel {
     ERROR,
 }
 
+/// All environment variables and their default values used by the program
 pub const POSSIBLE_ENV_VARS: [(&str, &str); 14] = [
     ("K8S_LDAP_AUTH_KEY_PATH", "./pki/server/webhook-server.key"),
     ("K8S_LDAP_AUTH_CERT_PATH", "./pki/server/webhook-server.pem"),
@@ -31,21 +34,33 @@ pub const POSSIBLE_ENV_VARS: [(&str, &str); 14] = [
     ("K8S_LDAP_AUTH_LDAP_TOKEN_ATTR", "k8sToken"),
 ];
 
+/// Stores the args in their respective categories for use in [main](crate::main)
 pub struct Args {
     log_level: LogLevel,
     log_file_path: Option<String>,
+    /// IP address and port
     socket_args: (String, u16),
+    /// Key path, server cert path and CA cert path
     tls_args: (String, String, String),
     ldap_args: LdapArgs,
 }
 
 impl Args {
+    /// Returns an new instance of [Args]
+    ///
+    /// Receives an iterator for program given args and the app version for banner print
+    ///
+    /// # Return
+    ///
+    /// When it's a regular compilation, either returns `Args`, or exits with code 1 in case
+    /// of failure in parsing args or returns [anyhow::Error] if [logging] could not be configured.
+    /// If it's a test environment, instead of exit in case of incorrect args, it returns [clap::Error] as [anyhow::Error].
     pub fn new<I, T>(iter: I, version: &'static str) -> Result<Self>
     where
         I: IntoIterator<Item = T> + Clone,
         T: Into<std::ffi::OsString> + Clone,
     {
-        let parser = Self::create_parser(&version);
+        let parser = Self::create_parser(&version); // First parser to get the env file path
 
         let env_file_path = Self::get_specific_arg(
             parser.clone(),
@@ -56,6 +71,7 @@ impl Args {
         #[cfg(test)]
         let load_env_res = from_filename_override(env_file_path);
 
+        // In tests, don't load the fallback .env file in order to not affect the tests
         #[cfg(not(test))]
         let mut load_env_res = from_filename_override(env_file_path);
 
@@ -64,9 +80,8 @@ impl Args {
             load_env_res = dotenvy::dotenv();
         }
 
-        let parser: Command;
-
-        parser = Self::create_parser(&version);
+        // The parser for get the log level and log file path to start logging
+        let parser: Command = Self::create_parser(&version);
 
         let log_level = Self::get_specific_arg(
             parser.clone(),
@@ -85,6 +100,7 @@ impl Args {
 
         let log_level = Self::parse_log_level(&log_level);
 
+        // Start logging
         logging::print_banner(
             version,
             log_file_path.as_deref().map(Path::new),
@@ -199,6 +215,7 @@ impl Args {
         })
     }
 
+    /// Gets an argument that is single value and passes to the given callback `process_arg`
     fn save_arg<T, U>(
         matches: &ArgMatches,
         name: &str,
@@ -212,6 +229,7 @@ impl Args {
         process_arg(arg)
     }
 
+    /// Multivalue version of [Args::save_arg]
     fn save_arg_many<T, U>(
         matches: &ArgMatches,
         name: &str,
@@ -433,6 +451,7 @@ impl Args {
         command
     }
 
+    /// Consume the instance and returns the tuple with the parsed args
     pub fn get_all_args(
         self,
     ) -> (
@@ -493,6 +512,7 @@ mod tests {
         ]
     }
 
+    // Called to reset environment variables between tests
     unsafe fn clear_env() {
         for (key, _) in &POSSIBLE_ENV_VARS {
             unsafe { env::remove_var(key) };

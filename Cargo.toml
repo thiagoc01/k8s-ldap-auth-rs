@@ -40,4 +40,5 @@ port-selector = "0.1.7"
 pretty_assertions = "1.4"
 
 [features]
+## Enables tests with LDAP server in a Docker container
 tests-ldap-ext = ["dep:testcontainers"]

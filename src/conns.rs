@@ -1,3 +1,5 @@
+//! Manages the server socket, mTLS, connections states, requests and responses
+
 use anyhow::{Context, Result};
 use rustls_pki_types::{
     CertificateDer, PrivateKeyDer, pem::Error, pem::PemObject,
@@ -20,8 +22,23 @@ use crate::token::handle_tokenreview_request;
 
 use crate::logging;
 
+/// Result of request parse
 enum ParseOutcome {
+    /// This variant indicates that the request is successfully parsed, i.e., it's a valid [TokenReview](k8s_openapi::api::authentication::v1::TokenReview) payload
+    ///
+    /// ### Fields
+    /// * `.0` - The body request string
+    /// * `.1` - The endpoint of request
+    /// * `.2` - The number of bytes read
+    /// * `.3` - The timeout query arg
     Body(String, String, usize, Option<Duration>),
+    /// This variant indicates that the request was handled and finished by [parse_http_request]
+    ///
+    /// ### Fields
+    /// * `.0` - HTTP code
+    /// * `.1` - The endpoint of request
+    /// * `.2` - The method of request
+    /// * `.3` - The number of bytes read
     Handled(u16, String, String, usize),
 }
 
@@ -36,7 +53,7 @@ pub enum HttpVerb {
     Options,
 }
 
-// Convert from a string slice to the Enum
+/// Convert from a string slice to the respective [HttpVerb]
 impl FromStr for HttpVerb {
     type Err = String;
 
@@ -109,6 +126,7 @@ fn set_tls(
     Ok(TlsAcceptor::from(Arc::new(server_tls_config)))
 }
 
+/// Application server boot using the [Args](`crate::Args`)
 pub async fn start_server(
     ip_address: String,
     port: u16,
@@ -125,7 +143,11 @@ pub async fn start_server(
         port,
     );
 
-    let tracker = TaskTracker::new();
+    let tracker = TaskTracker::new(); // Manager of requests threads
+
+    /*
+        Both handlers used to catch the signals and end the connections gracefully
+    */
 
     let mut sigterm_handler = signal(SignalKind::terminate())
         .context("Could not set up SIGTERM handler")?;
@@ -226,6 +248,10 @@ pub async fn start_server(
     Ok(())
 }
 
+/// Entrypoint of connection handle
+///
+/// This function is responsible to start the parsing of user request and return the response
+/// In case of problems in connection or invalid HTTP request, the function ends early logging the cause
 async fn handle_conn(
     stream: &mut TlsStream<TcpStream>,
     ldap_connector: &Arc<dyn LdapBackend>,
@@ -239,6 +265,7 @@ async fn handle_conn(
 
     let (body_str, endpoint, bytes_read, k8s_timeout) =
         match parse_http_request(stream).await? {
+            // Connection already finished and response sent
             ParseOutcome::Handled(
                 code,
                 endpoint,
@@ -276,11 +303,15 @@ async fn handle_conn(
         };
 
     let ldap_timeout = ldap_connector.get_timeout();
+
+    // Sets the timeout of connection based on LDAP configured value or timeout query argument from request
     let effective_timeout = match k8s_timeout {
         Some(k8s_timeout) => Some(k8s_timeout.min(ldap_timeout)),
         None => None,
     };
 
+    // Either authenticates the user using the TokenReview,
+    // or finishes the connection if it's closed or finishes if timeout is reached
     let token_review_str = tokio::select! {
         token_review_str = handle_tokenreview_request(&body_str, &ldap_connector) => {
             token_review_str
@@ -309,6 +340,7 @@ async fn handle_conn(
     .await
 }
 
+/// Retrieves the [TokenReview](k8s_openapi::api::authentication::v1::TokenReview) from request or finishes the connection depending on the structure of the request
 async fn parse_http_request(
     stream: &mut TlsStream<TcpStream>,
 ) -> Result<ParseOutcome> {
@@ -336,6 +368,7 @@ async fn parse_http_request(
 
         let start = old_len.saturating_sub(3);
 
+        // Search for the end of HTTP header section
         if let Some(pos) = raw_request[start..]
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
@@ -363,6 +396,7 @@ async fn parse_http_request(
     let (method, endpoint, k8s_timeout) =
         _extract_method_endpoint_timeout_url(&request_str);
 
+    // Incorrect HTTP request
     if endpoint == "UNKNOWN" || method == "UNKNOWN" {
         _send_response(stream, 400, b"").await?;
         return Ok(ParseOutcome::Handled(
@@ -371,7 +405,9 @@ async fn parse_http_request(
             String::from("UNKNOWN"),
             raw_request.len() - header_end,
         ));
-    } else if endpoint != "/authenticate" {
+    }
+    // The only endpoint accepted by this server is `/authenticate`
+    else if endpoint != "/authenticate" {
         _send_response(stream, 404, b"").await?;
         return Ok(ParseOutcome::Handled(
             404,
@@ -379,7 +415,9 @@ async fn parse_http_request(
             method,
             raw_request.len() - header_end,
         ));
-    } else if method != "POST" {
+    }
+    // Only POST is allowed
+    else if method != "POST" {
         _send_response(stream, 405, b"").await?;
         return Ok(ParseOutcome::Handled(
             405,
@@ -437,6 +475,9 @@ async fn parse_http_request(
     }
 }
 
+/// Gets the HTTP method, request endpoint and timeout URI parameter
+///
+/// In case of a invalid method or endpoint, the values are set to UNKNOWN
 fn _extract_method_endpoint_timeout_url(
     request_str: &str,
 ) -> (String, String, Option<Duration>) {
@@ -489,6 +530,7 @@ fn _extract_method_endpoint_timeout_url(
         ))
 }
 
+/// Watches for abrupt connection close and ends the request handling
 async fn _check_remote_peer(
     stream: &mut TlsStream<TcpStream>,
     peer_addr: &IpAddr,
@@ -521,6 +563,7 @@ async fn _check_remote_peer(
     }
 }
 
+/// Analyzes the validity of [TokenReview](k8s_openapi::api::authentication::v1::TokenReview) and authentication and sends the respective response
 async fn _verify_token_review_str_result(
     token_review_str: Result<(String, String, bool)>,
     stream: &mut TlsStream<TcpStream>,
@@ -569,6 +612,7 @@ async fn _verify_token_review_str_result(
             Ok(())
         },
 
+        // The `TokenReview` body is not valid
         Err(error) if error.to_string().starts_with("Error") => {
             if let Err(error) = _send_response(stream, 400, b"").await
             {
@@ -590,6 +634,7 @@ async fn _verify_token_review_str_result(
             Ok(())
         },
 
+        // The server couldn't complete the request analysis
         Err(error) => {
             if let Err(error) = _send_response(stream, 500, b"").await
             {
@@ -613,6 +658,7 @@ async fn _verify_token_review_str_result(
     }
 }
 
+/// Sends the final response to the client
 async fn _send_response(
     stream: &mut TlsStream<TcpStream>,
     code: u16,
@@ -704,6 +750,7 @@ mod tests {
         }
     }
 
+    // Special `LdapBackend` implementation to test timeouts and peer resets
     struct LdapTestPeerReset {
         result: Result<SearchEntry, String>,
         attrs: HashMap<String, String>,

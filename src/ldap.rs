@@ -1,3 +1,5 @@
+//! Controls the interaction with LDAP server and options for the LDAP requests
+
 use anyhow::{Context, Error, Result};
 use async_trait::async_trait;
 use ldap3::{
@@ -14,6 +16,7 @@ use std::time::{Duration, Instant};
 use crate::logging;
 
 #[derive(PartialEq, Eq, Debug)]
+/// Stores the args used to construct the [`LdapConnector`] instance
 pub struct LdapArgs {
     ldap_url: String,
     ldap_bind_user: String,
@@ -52,18 +55,23 @@ impl LdapArgs {
     }
 }
 
+/// Trait to describe the behavior of a LDAP request handler for tests and normal code
 #[async_trait]
 pub trait LdapBackend: Send + Sync {
+    /// Receives the user and the secret and validates in LDAP server
     async fn search_user(
         &self,
         user: &str,
         secret: &str,
     ) -> Result<SearchEntry>;
 
+    /// Gets the LDAP attributes that are requested in all LDAP requests of this instance
     fn get_attrs(&self) -> &HashMap<String, String>;
+
     fn get_timeout(&self) -> Duration;
 }
 
+/// LDAP handler to connect on the configured LDAP server
 pub struct LdapConnector {
     ldap_url: String,
     bind_user: String,
@@ -380,7 +388,8 @@ fn check_hashs_constant_time(a: &[u8], b: &[u8]) -> bool {
         == 0
 }
 
-pub fn verify_token(secret: &str, stored: &str) -> bool {
+/// Checks if the token send as secret is equal to the stored in LDAP server
+fn verify_token(secret: &str, stored: &str) -> bool {
     if let Some(hash) = stored.strip_prefix("sha256:") {
         let computed = encode_hex(&Sha256::digest(secret.as_bytes()));
         check_hashs_constant_time(
@@ -584,6 +593,10 @@ mod tests {
     }
 }
 
+/// Tests using a LDAP server with a Docker container
+///
+/// The container is created using [`testcontainers`] and the LDAP server is set with the LDIF files in `tests-fixtures` folder
+/// Since not everyone has a Docker environment set, these tests are activated with the `tests-ldap-ext` feature
 #[cfg(all(test, feature = "tests-ldap-ext"))]
 mod tests_ldap_ext {
 

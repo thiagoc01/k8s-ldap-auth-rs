@@ -1,3 +1,8 @@
+//! Responsible for receive the client request as [String], convert to [TokenReview]
+//! and authenticate the user. If the request is not valid, provide the respective error and [TokenReview::status].
+//!
+//! This module behavior is bounded by the official [Kubernetes Authentication doc](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#webhook-token-authentication).
+
 use anyhow::{Context, Error, Result};
 use base64::engine::Engine;
 use k8s_openapi::api::authentication::v1::{
@@ -10,6 +15,32 @@ use std::sync::Arc;
 
 use crate::ldap::LdapBackend;
 
+/// Extracts the user and secret from the provided token
+///
+/// # Example
+///
+/// ## Request
+/// ```json
+/// {
+///  "apiVersion": "authentication.k8s.io/v1",
+///  "kind": "TokenReview",
+///  "spec": {
+///    # base64 of johndoe:pass
+///    "token": "am9obmRvZTpwYXNz",
+///
+///    # Optional list of the audience identifiers for the server the token was presented to.
+///    # Audience-aware token authenticators (for example, OIDC token authenticators)
+///    # should verify the token was intended for at least one of the audiences in this list,
+///    # and return the intersection of this list and the valid audiences for the token in the response status.
+///    # This ensures the token is valid to authenticate to the server it was presented to.
+///    # If no audiences are provided, the token should be validated to authenticate to the Kubernetes API server.
+///    "audiences": ["https://myserver.example.com", "https://myserver.internal.example.com"]
+///  }
+/// }
+/// ```
+/// ## User and secret
+/// "johndoe:pass"
+///
 fn retrieve_user_secret_from_token(
     token_base64: Option<String>,
 ) -> Result<(String, String)> {
@@ -41,6 +72,59 @@ fn retrieve_user_secret_from_token(
     Ok((user.to_owned(), secret.to_owned()))
 }
 
+/// Returns a [TokenReview] with [TokenReview::status] defined based on the request
+///
+/// If the user is authenticated, [TokenReview::status] with [TokenReviewStatus::authenticated] set to `true` and
+/// all the specific fields defined in the Kubernetes docs.
+/// Otherwise, returns [TokenReview::status] with [TokenReviewStatus::authenticated] set to `false` and the error
+/// that caused the failure set in the `error` field.
+///
+/// # `attrs_map` argument
+///
+/// This is the [std::collections::HashMap] of Kubernetes [TokenReview] fields into LDAP attributes.
+/// Keys that start with `k8s_extra_` are added to `extra` object in `user` object.
+///
+/// # Examples
+///
+/// ## Example valid user
+/// ```json
+/// {
+///  # User "johndoe" with LDAP groups "ipausers", "gitlab", "portainer"
+///  "apiVersion": "authentication.k8s.io/v1",
+///  "kind": "TokenReview",
+///  "status": {
+///    "authenticated": true,
+///    "audiences": ["https://myserver.example.com", "https://myserver.internal.example.com"],
+///    "user": {
+///         "username": "johndoe",
+///         "groups": [
+///             "ipausers",
+///             "gitlab",
+///             "portainer"
+///         ],
+///         "extra": {
+///             "sn": [
+///                 "Doe"
+///             ]
+///         }
+///    }
+///  }
+/// }
+/// ```
+///
+/// ## Example invalid user
+///
+/// ```json
+/// {
+///  # Consider nonexistent user "johnnydoe"
+///  "apiVersion": "authentication.k8s.io/v1",
+///  "kind": "TokenReview",
+///  "status": {
+///    "authenticated": false,
+///    "error": "LDAP user johnnydoe not found"
+///  }
+/// }
+/// ```
 fn create_tokenreview_status(
     search_entry: Option<SearchEntry>,
     audiences: Option<Vec<String>>,
@@ -66,7 +150,7 @@ fn create_tokenreview_status(
                 None => None,
             }
         } else {
-            None
+            None // Didn't request uid
         };
 
         let groups = if let Some(groups_map) =
@@ -79,6 +163,7 @@ fn create_tokenreview_status(
                     dn_groups
                         .iter()
                         .map(|dn| {
+                            // Gets the name of the group (cn=<name>,...,....,dc=...,dc=...)
                             let cn: &str =
                                 dn.split(',').next().unwrap();
                             String::from(&cn[3..])
@@ -86,10 +171,10 @@ fn create_tokenreview_status(
                         .collect(),
                 )
             } else {
-                None
+                None // Don't belong to any groups
             }
         } else {
-            None
+            None // Didn't request groups
         };
 
         let extras = attrs_map
@@ -134,6 +219,14 @@ fn create_tokenreview_status(
     }
 }
 
+/// Gets the body of the request from client and authenticates the user in LDAP
+///
+/// # Return
+///
+/// Returns the following triple of fields:
+/// * .0 - [TokenReview] with [TokenReview::status] set
+/// * .1 - username that was verified
+/// * .2 - [TokenReviewStatus::authenticated] field
 pub async fn handle_tokenreview_request(
     request: &str,
     ldap_connector: &Arc<dyn LdapBackend>,
